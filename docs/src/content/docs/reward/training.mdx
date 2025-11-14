@@ -1,0 +1,807 @@
+---
+title: Training Reward Models
+description: Complete guide to training reward models - loss functions, optimization, implementation, and best practices
+---
+
+import { Tabs, TabItem, Aside, Card, CardGrid, Steps } from '@astrojs/starlight/components';
+
+## Overview of Reward Model Training
+
+Training a reward model is conceptually simple:
+1. Load preference data `(prompt, chosen, rejected)`
+2. Compute reward scores for both responses
+3. Optimize ranking loss: make chosen score > rejected score
+4. Evaluate on held-out preferences
+
+But the details matter! Let's dive into the implementation from `src/auto_bot_tuner/rlhf/`.
+
+## The Ranking Loss
+
+### Mathematical Formulation
+
+The core training objective is the **Bradley-Terry ranking loss**:
+
+$$
+\mathcal{L}_{\text{RM}} = -\mathbb{E}_{(x, y_w, y_l) \sim D} \left[ \log \sigma(r_\theta(x, y_w) - r_\theta(x, y_l)) \right]
+$$
+
+where:
+- $x$ = prompt
+- $y_w$ = chosen (winner) response
+- $y_l$ = rejected (loser) response
+- $r_\theta(x, y)$ = reward model score for response $y$ to prompt $x$
+- $\sigma(z) = \frac{1}{1 + e^{-z}}$ = sigmoid function
+
+**Goal:** Maximize $P(y_w \succ y_l | x) = \sigma(r_\theta(x, y_w) - r_\theta(x, y_l))$
+
+### Implementation
+
+From `src/auto_bot_tuner/rlhf/loss.py`:
+
+```python
+import torch.nn.functional as F
+
+def compute_ranking_loss(
+    chosen_rewards: torch.Tensor,
+    rejected_rewards: torch.Tensor,
+    margin: float = 0.0,
+    reduction: str = "mean"
+) -> torch.Tensor:
+    """
+    Compute ranking loss for reward model training.
+
+    Loss = -log(sigmoid(chosen_reward - rejected_reward - margin))
+
+    Args:
+        chosen_rewards: Rewards for chosen responses, shape (batch_size,)
+        rejected_rewards: Rewards for rejected responses, shape (batch_size,)
+        margin: Optional margin to enforce minimum difference
+        reduction: "mean", "sum", or "none"
+
+    Returns:
+        Ranking loss tensor
+    """
+    # Compute difference: chosen should be higher than rejected
+    logits = chosen_rewards - rejected_rewards - margin
+
+    # Apply log-sigmoid for numerical stability
+    # -log(sigmoid(x)) = log(1 + exp(-x)) = softplus(-x)
+    loss = F.softplus(-logits)
+
+    if reduction == "mean":
+        return loss.mean()
+    elif reduction == "sum":
+        return loss.sum()
+    else:
+        return loss
+```
+
+**Why softplus?** For numerical stability:
+- Direct: $-\log(\sigma(x)) = -\log\left(\frac{1}{1+e^{-x}}\right) = \log(1 + e^{-x})$
+- Softplus: $\text{softplus}(x) = \log(1 + e^x)$
+- Therefore: $-\log(\sigma(x)) = \text{softplus}(-x)$
+
+This avoids computing logarithms of very small numbers!
+
+### Understanding the Margin
+
+The optional **margin** parameter enforces a minimum difference:
+
+$$
+\mathcal{L}_{\text{margin}} = -\log \sigma(r_\theta(x, y_w) - r_\theta(x, y_l) - m)
+$$
+
+<Tabs>
+  <TabItem label="margin = 0.0">
+**Standard Bradley-Terry:** Just requires chosen > rejected
+
+**Behavior:**
+- Loss = 0 when chosen_reward > rejected_reward (any amount)
+- Permissive: small differences are acceptable
+- Natural learning: model decides how confident to be
+
+**Use when:** Starting out, high-quality preference data
+</TabItem>
+
+  <TabItem label="margin = 0.5">
+**With margin:** Requires chosen_reward > rejected_reward + 0.5
+
+**Behavior:**
+- Loss > 0 until difference exceeds margin
+- Pushes model to be more confident
+- Forces clear separation between good/bad responses
+
+**Use when:** Noisy preference data, want confident scores
+</TabItem>
+</Tabs>
+
+**Typical values:**
+- `margin = 0.0` (most common, natural)
+- `margin = 0.5` (moderate confidence)
+- `margin = 1.0` (high confidence)
+
+## Training Metrics
+
+We track several metrics beyond just loss:
+
+```python
+def compute_ranking_loss_with_metrics(
+    chosen_rewards: torch.Tensor,
+    rejected_rewards: torch.Tensor,
+    margin: float = 0.0
+) -> dict:
+    """Compute ranking loss with additional metrics."""
+    loss = compute_ranking_loss(chosen_rewards, rejected_rewards, margin)
+
+    # Accuracy: how often does model rank chosen higher?
+    accuracy = (chosen_rewards > rejected_rewards).float().mean()
+
+    # Mean rewards
+    mean_chosen = chosen_rewards.mean()
+    mean_rejected = rejected_rewards.mean()
+
+    # Mean margin (reward difference)
+    mean_margin = (chosen_rewards - rejected_rewards).mean()
+
+    return {
+        "loss": loss,
+        "accuracy": accuracy,
+        "mean_chosen_reward": mean_chosen,
+        "mean_rejected_reward": mean_rejected,
+        "mean_margin": mean_margin,
+    }
+```
+
+### Key Metrics Explained
+
+| Metric | What It Measures | Target |
+|--------|------------------|--------|
+| **Loss** | How well model predicts preferences | Decreasing over time |
+| **Accuracy** | % of pairs where chosen > rejected | > 70% (aim for 80%+) |
+| **Mean Chosen Reward** | Average score for preferred responses | Higher than rejected |
+| **Mean Rejected Reward** | Average score for non-preferred | Lower than chosen |
+| **Mean Margin** | Average reward difference | Positive and increasing |
+
+<Aside type="tip">
+  **Accuracy is the most interpretable metric!** If accuracy is 80%, the reward model correctly identifies the better response 80% of the time.
+</Aside>
+
+## Complete Training Pipeline
+
+### Step 1: Setup
+
+```python
+from src.auto_bot_tuner.rlhf import (
+    create_reward_model_from_pretrained,
+    RewardModelTrainer,
+    RewardModelConfig,
+    RewardModelDataset
+)
+from datasets import load_dataset
+
+# Load preference data
+raw_data = load_dataset("Anthropic/hh-rlhf", split="train")
+raw_eval = load_dataset("Anthropic/hh-rlhf", split="test")
+
+# Create reward model from SFT checkpoint
+reward_model = create_reward_model_from_pretrained(
+    model_name="path/to/sft_model",
+    tokenizer=tokenizer,
+    freeze_base=False,  # Train full model
+    device=device
+)
+
+# Wrap in dataset
+train_dataset = RewardModelDataset(raw_data, tokenizer, max_length=512)
+eval_dataset = RewardModelDataset(raw_eval, tokenizer, max_length=512)
+```
+
+### Step 2: Configure Training
+
+```python
+config = RewardModelConfig(
+    # Optimization
+    learning_rate=1e-5,        # Lower than SFT!
+    batch_size=4,              # Small due to memory (2 sequences per sample)
+    gradient_accumulation_steps=4,  # Effective batch size = 16
+    num_epochs=1,              # Usually 1 epoch is enough
+    warmup_steps=100,
+
+    # Loss
+    margin=0.0,                # Standard Bradley-Terry
+
+    # Regularization
+    max_grad_norm=1.0,         # Gradient clipping
+    weight_decay=0.01,
+
+    # Logging
+    logging_steps=10,
+    eval_steps=500,
+    save_steps=500,
+
+    # Output
+    output_dir="checkpoints/reward_model"
+)
+```
+
+**Key hyperparameter choices:**
+
+<CardGrid>
+  <Card title="Learning Rate">
+    **1e-5** (much lower than SFT's 2e-4)
+
+    **Why?** Reward model builds on SFT weights. Large updates can destroy learned representations.
+  </Card>
+
+  <Card title="Batch Size">
+    **4** (small)
+
+    **Why?** Each sample has TWO sequences (chosen + rejected), effectively doubling memory usage.
+  </Card>
+
+  <Card title="Num Epochs">
+    **1** (just one pass)
+
+    **Why?** Reward models overfit easily. One epoch on large preference data is sufficient.
+  </Card>
+
+  <Card title="Gradient Accumulation">
+    **4 steps**
+
+    **Why?** Simulate larger batch size (effective batch = 4 × 4 = 16) without OOM.
+  </Card>
+</CardGrid>
+
+### Step 3: Train
+
+```python
+trainer = RewardModelTrainer(
+    model=reward_model,
+    tokenizer=tokenizer,
+    train_dataset=train_dataset,
+    eval_dataset=eval_dataset,
+    config=config
+)
+
+# Start training
+results = trainer.train()
+
+print(f"Training completed!")
+print(f"Total steps: {results['total_steps']}")
+print(f"Best eval accuracy: {results['best_eval_accuracy']:.4f}")
+```
+
+### Step 4: Monitor Training
+
+During training, you'll see:
+
+```
+Reward Model Training: 100%|████████| 5000/5000 [1:23:45<00:00]
+loss=0.2341 acc=0.823 margin=1.234 lr=9.5e-06
+```
+
+**What to watch for:**
+
+✅ **Good training:**
+- Loss decreases steadily
+- Accuracy increases to 75-85%
+- Mean margin increases (growing confidence)
+- Validation accuracy tracks training accuracy
+
+❌ **Problems:**
+- Accuracy stuck &lt; 60% → model not learning
+- Mean margin near 0 → predictions too uncertain
+- Validation accuracy ≪ training → overfitting
+
+## Training Loop Implementation
+
+Let's understand what happens inside `trainer.train()` (from `src/auto_bot_tuner/rlhf/trainer.py`):
+
+```python
+def train(self) -> dict:
+    """Run the reward model training loop."""
+    train_loader = DataLoader(
+        self.train_dataset,
+        batch_size=self.config.batch_size,
+        shuffle=True,
+        num_workers=0
+    )
+
+    self.model.train()
+
+    for epoch in range(self.config.num_epochs):
+        for batch_idx, batch in enumerate(train_loader):
+            # Move to device
+            batch = {k: v.to(self.device) for k, v in batch.items()}
+
+            # Forward pass for CHOSEN responses
+            chosen_rewards = self.model.get_rewards(
+                batch["chosen_input_ids"],
+                batch["chosen_attention_mask"]
+            )
+
+            # Forward pass for REJECTED responses
+            rejected_rewards = self.model.get_rewards(
+                batch["rejected_input_ids"],
+                batch["rejected_attention_mask"]
+            )
+
+            # Compute ranking loss with metrics
+            metrics = compute_ranking_loss_with_metrics(
+                chosen_rewards,
+                rejected_rewards,
+                margin=self.config.margin
+            )
+            loss = metrics["loss"]
+
+            # Scale for gradient accumulation
+            loss = loss / self.config.gradient_accumulation_steps
+
+            # Backward pass
+            loss.backward()
+
+            # Update every N steps
+            if (batch_idx + 1) % self.config.gradient_accumulation_steps == 0:
+                # Clip gradients
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.config.max_grad_norm
+                )
+
+                # Optimizer step
+                self.optimizer.step()
+                self.scheduler.step()
+                self.optimizer.zero_grad()
+
+                self.global_step += 1
+
+            # Logging, evaluation, checkpointing...
+```
+
+### Key Implementation Details
+
+#### 1. Two Forward Passes Per Batch
+
+```python
+chosen_rewards = model.get_rewards(chosen_input_ids, chosen_attention_mask)
+rejected_rewards = model.get_rewards(rejected_input_ids, rejected_attention_mask)
+```
+
+We run the model **twice**: once for chosen, once for rejected. This doubles compute compared to standard language modeling!
+
+**Memory tip:** Process chosen and rejected sequentially, not in parallel:
+
+```python
+# ❌ Don't do this (OOM):
+all_input_ids = torch.cat([chosen_input_ids, rejected_input_ids], dim=0)
+all_rewards = model.get_rewards(all_input_ids, all_attention_mask)
+
+# ✅ Do this:
+chosen_rewards = model.get_rewards(chosen_input_ids, chosen_attention_mask)
+rejected_rewards = model.get_rewards(rejected_input_ids, rejected_attention_mask)
+```
+
+#### 2. Gradient Accumulation
+
+```python
+loss = loss / gradient_accumulation_steps
+loss.backward()
+
+if (step + 1) % gradient_accumulation_steps == 0:
+    optimizer.step()
+    optimizer.zero_grad()
+```
+
+This simulates larger batch sizes:
+- Effective batch size = `batch_size × gradient_accumulation_steps`
+- Example: `4 × 4 = 16` effective batch size
+
+**Why?** Larger batches improve stability but cause OOM. Accumulation gives us the benefits without the memory cost!
+
+#### 3. Gradient Clipping
+
+```python
+torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm=1.0)
+```
+
+**Why clip?** Reward models can have exploding gradients, especially early in training. Clipping prevents instability.
+
+#### 4. Learning Rate Schedule
+
+```python
+def lr_lambda(current_step):
+    if current_step < warmup_steps:
+        # Linear warmup
+        return float(current_step) / float(max(1, warmup_steps))
+    else:
+        # Linear decay
+        return max(0.0, 1.0 - progress)
+
+scheduler = LambdaLR(optimizer, lr_lambda)
+```
+
+This creates a **warmup then decay** schedule:
+
+```
+Learning Rate
+    │
+1e-5┤     ╱─────────╲
+    │    ╱           ╲
+    │   ╱             ╲___
+    │  ╱                  ╲
+  0 ├─────────────────────────> Steps
+      ↑         ↑
+    warmup    decay
+```
+
+## Evaluation During Training
+
+### Evaluation Loop
+
+Every `eval_steps`, we run evaluation:
+
+```python
+def evaluate(self) -> dict:
+    """Evaluate reward model on eval dataset."""
+    self.model.eval()
+
+    eval_loader = DataLoader(self.eval_dataset, batch_size=self.config.batch_size)
+
+    total_loss = 0.0
+    total_accuracy = 0.0
+    total_margin = 0.0
+    num_batches = 0
+
+    with torch.no_grad():
+        for batch in eval_loader:
+            batch = {k: v.to(self.device) for k, v in batch.items()}
+
+            # Get rewards
+            chosen_rewards = self.model.get_rewards(
+                batch["chosen_input_ids"],
+                batch["chosen_attention_mask"]
+            )
+            rejected_rewards = self.model.get_rewards(
+                batch["rejected_input_ids"],
+                batch["rejected_attention_mask"]
+            )
+
+            # Compute metrics
+            metrics = compute_ranking_loss_with_metrics(
+                chosen_rewards, rejected_rewards, self.config.margin
+            )
+
+            total_loss += metrics["loss"].item()
+            total_accuracy += metrics["accuracy"].item()
+            total_margin += metrics["mean_margin"].item()
+            num_batches += 1
+
+    # Average metrics
+    eval_metrics = {
+        "loss": total_loss / num_batches,
+        "accuracy": total_accuracy / num_batches,
+        "mean_margin": total_margin / num_batches,
+    }
+
+    print(f"Eval - Loss: {eval_metrics['loss']:.4f}, "
+          f"Accuracy: {eval_metrics['accuracy']:.4f}")
+
+    return eval_metrics
+```
+
+### When to Save Checkpoints
+
+```python
+if eval_metrics["accuracy"] > self.best_eval_accuracy:
+    self.best_eval_accuracy = eval_metrics["accuracy"]
+    self.save_checkpoint(is_best=True)
+```
+
+We save the checkpoint with the **highest validation accuracy**, not lowest loss!
+
+**Why?** Accuracy directly measures preference prediction, which is what we care about for RLHF.
+
+## Alternative Loss Functions
+
+Besides Bradley-Terry, other losses are available:
+
+### 1. Hinge Loss (Pairwise)
+
+```python
+def compute_pairwise_loss(
+    chosen_rewards: torch.Tensor,
+    rejected_rewards: torch.Tensor,
+    margin: float = 1.0
+) -> torch.Tensor:
+    """
+    Pairwise hinge loss: max(0, margin - (chosen - rejected))
+
+    Similar to SVM ranking loss. Penalizes when difference < margin.
+    """
+    diff = chosen_rewards - rejected_rewards
+    loss = F.relu(margin - diff)
+    return loss.mean()
+```
+
+**Comparison with Bradley-Terry:**
+
+| Aspect | Bradley-Terry | Hinge |
+|--------|---------------|-------|
+| **Loss shape** | Log-sigmoid (smooth) | Piecewise linear |
+| **Zero loss when** | chosen >> rejected | chosen > rejected + margin |
+| **Gradient** | Always non-zero | Zero when satisfied |
+| **Use case** | General purpose | When you want hard margin |
+
+### 2. Contrastive Loss
+
+```python
+def compute_contrastive_loss(
+    chosen_rewards: torch.Tensor,
+    rejected_rewards: torch.Tensor,
+    temperature: float = 0.1
+) -> torch.Tensor:
+    """
+    Contrastive loss treating reward as classification.
+
+    Frames preference learning as: "Which response is better?"
+    with softmax over [chosen, rejected].
+    """
+    # Stack rewards: (batch_size, 2)
+    rewards = torch.stack([chosen_rewards, rejected_rewards], dim=1)
+
+    # Scale by temperature
+    rewards = rewards / temperature
+
+    # Labels: 0 = chosen is better
+    labels = torch.zeros(chosen_rewards.shape[0], dtype=torch.long)
+
+    # Cross-entropy loss
+    loss = F.cross_entropy(rewards, labels)
+    return loss
+```
+
+**When to use:** When you want to frame preferences as classification rather than ranking.
+
+### 3. Listwise Loss
+
+For datasets with multiple ranked responses (not just pairs):
+
+```python
+def compute_listwise_loss(
+    rewards: torch.Tensor,       # (batch_size, num_responses)
+    rankings: torch.Tensor,      # (batch_size, num_responses)
+    temperature: float = 1.0
+) -> torch.Tensor:
+    """
+    ListNet loss for ranking multiple responses.
+
+    Treats ranking as predicting probability distribution over
+    which response is best.
+    """
+    # Convert rankings to probabilities (lower rank = higher prob)
+    target_probs = F.softmax(-rankings.float() / temperature, dim=-1)
+
+    # Convert rewards to probabilities
+    pred_probs = F.softmax(rewards / temperature, dim=-1)
+
+    # KL divergence loss
+    loss = F.kl_div(pred_probs.log(), target_probs, reduction='batchmean')
+
+    return loss
+```
+
+**Use case:** Datasets like OpenAssistant with multiple ranked responses per prompt.
+
+## Optimizing Training Performance
+
+### Memory Optimization
+
+<Tabs>
+  <TabItem label="Reduce Batch Size">
+```python
+config = RewardModelConfig(
+    batch_size=2,  # Down from 4
+    gradient_accumulation_steps=8  # Up from 4
+)
+# Effective batch size still 16
+```
+**Effect:** Reduces peak memory, increases training time slightly
+</TabItem>
+
+  <TabItem label="Reduce Max Length">
+```python
+dataset = RewardModelDataset(
+    data,
+    tokenizer,
+    max_length=384  # Down from 512
+)
+```
+**Effect:** Major memory savings, may truncate long responses
+</TabItem>
+
+  <TabItem label="Freeze Base Model">
+```python
+reward_model = create_reward_model_from_pretrained(
+    model_name="gpt2",
+    tokenizer=tokenizer,
+    freeze_base=True  # Only train value head
+)
+```
+**Effect:** Huge memory savings, lower accuracy potential
+</TabItem>
+
+  <TabItem label="Use Mixed Precision">
+```python
+config = RewardModelConfig(
+    fp16=True  # Enable mixed precision (NVIDIA)
+    # Or bf16=True for A100/H100
+)
+```
+**Effect:** ~50% memory reduction, minimal accuracy loss
+</TabItem>
+</Tabs>
+
+### Speed Optimization
+
+```python
+# 1. Increase dataloader workers
+config = RewardModelConfig(
+    dataloader_num_workers=4  # Parallel data loading
+)
+
+# 2. Pin memory for faster GPU transfer
+train_loader = DataLoader(
+    dataset,
+    batch_size=4,
+    pin_memory=True  # If using CUDA
+)
+
+# 3. Compile model (PyTorch 2.0+)
+reward_model = torch.compile(reward_model)
+```
+
+## Common Training Issues
+
+### Issue 1: Low Accuracy (&lt; 60%)
+
+**Symptoms:**
+- Accuracy stuck around 50-55%
+- Mean margin near zero
+- Model not learning preferences
+
+**Debugging:**
+
+```python
+# Check data quality
+from src.auto_bot_tuner.rlhf import preview_reward_sample
+
+for i in range(5):
+    sample = preview_reward_sample(dataset, idx=i)
+    print(f"Chosen: {sample['chosen'][:100]}")
+    print(f"Rejected: {sample['rejected'][:100]}")
+    print()
+```
+
+**Possible causes:**
+1. **Ambiguous preferences:** Chosen and rejected are too similar
+2. **Poor initialization:** Model not starting from SFT checkpoint
+3. **Learning rate too high:** Try 5e-6 instead of 1e-5
+4. **Insufficient capacity:** Frozen base model can't learn complex preferences
+
+**Solutions:**
+- Filter low-quality preference pairs
+- Start from SFT model, not base model
+- Decrease learning rate
+- Enable full fine-tuning (`freeze_base=False`)
+
+### Issue 2: Overfitting
+
+**Symptoms:**
+- Training accuracy 90%+ but eval accuracy < 70%
+- Training loss much lower than eval loss
+- Mean rewards very large (> 10)
+
+**Solutions:**
+
+```python
+config = RewardModelConfig(
+    num_epochs=1,           # Don't overtrain!
+    weight_decay=0.05,      # Increase regularization
+    dropout=0.2,            # More dropout in value head
+    max_steps=1000          # Limit total steps
+)
+
+# Or freeze base model
+reward_model = create_reward_model_from_pretrained(
+    model_name="gpt2",
+    freeze_base=True  # Less capacity → less overfitting
+)
+```
+
+### Issue 3: Training Instability
+
+**Symptoms:**
+- Loss spikes randomly
+- Gradients exploding (NaN values)
+- Rewards become very large
+
+**Solutions:**
+
+```python
+config = RewardModelConfig(
+    learning_rate=5e-6,     # Lower LR
+    max_grad_norm=0.5,      # Stronger clipping
+    warmup_steps=200,       # Longer warmup
+    gradient_accumulation_steps=8  # Larger effective batch
+)
+
+# Reinitialize value head
+reward_model.value_head[1].weight.data.normal_(mean=0.0, std=0.001)
+reward_model.value_head[1].bias.data.zero_()
+```
+
+### Issue 4: Length Bias
+
+**Symptoms:**
+- Model always predicts longer response is better
+- Accuracy high on training but poor on balanced eval set
+
+**Diagnosis:**
+
+```python
+import numpy as np
+
+chosen_lengths = [len(item["chosen"]) for item in dataset]
+rejected_lengths = [len(item["rejected"]) for item in dataset]
+
+print(f"Mean chosen length: {np.mean(chosen_lengths)}")
+print(f"Mean rejected length: {np.mean(rejected_lengths)}")
+```
+
+If chosen is consistently longer, the model learned a shortcut!
+
+**Solutions:**
+1. **Balance dataset:** Include examples where shorter is better
+2. **Length normalization:** Divide reward by length during evaluation
+3. **Augmentation:** Create pairs with length reversed
+
+## Advanced: Multi-Objective Reward Models
+
+Train separate reward models for different objectives:
+
+```python
+# Train helpfulness reward model
+helpful_rm = create_reward_model_from_pretrained("sft_model", tokenizer)
+helpful_trainer = RewardModelTrainer(
+    helpful_rm, tokenizer, helpful_dataset, config
+)
+helpful_trainer.train()
+
+# Train harmlessness reward model
+harmless_rm = create_reward_model_from_pretrained("sft_model", tokenizer)
+harmless_trainer = RewardModelTrainer(
+    harmless_rm, tokenizer, harmless_dataset, config
+)
+harmless_trainer.train()
+
+# Combine during RL
+from src.auto_bot_tuner.rlhf import EnsembleRewardModel
+
+ensemble = EnsembleRewardModel([helpful_rm, harmless_rm])
+combined_reward = ensemble(input_ids, attention_mask, aggregation="mean")
+```
+
+**Benefits:**
+- Specialized models for each objective
+- Can weight objectives differently
+- More robust to reward hacking
+
+## Next Steps
+
+You now understand reward model training! Next:
+
+1. **[Evaluation](/reward/evaluation/)** - How to thoroughly evaluate reward models
+2. **[Preference Data](/reward/preference-data/)** - Review data quality considerations
+3. **[RLHF with PPO](/rlhf/ppo/)** - Use your reward model for reinforcement learning
+
+Let's learn how to evaluate reward models! 📊

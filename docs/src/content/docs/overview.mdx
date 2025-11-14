@@ -1,0 +1,365 @@
+---
+title: Project Overview
+description: A comprehensive guide to what you'll learn and build
+---
+
+import { Card, CardGrid, Tabs, TabItem } from '@astrojs/starlight/components';
+
+## What You'll Build
+
+This project walks you through implementing **every major post-training technique** from scratch, with comprehensive educational documentation explaining the theory, mathematics, and implementation details.
+
+By the end, you'll have:
+
+✅ A deep understanding of how AI assistants are trained
+✅ Working implementations of SFT, RLHF, and DPO
+✅ Hands-on experience fine-tuning language models
+✅ Knowledge to adapt models for your own use cases
+
+## The Complete Pipeline
+
+We'll implement the full post-training pipeline used by ChatGPT, Claude, and other modern AI assistants:
+
+```
+┌─────────────────┐
+│  Base Model     │  GPT-2, Llama, etc.
+│  (Pre-trained)  │  Just predicts next tokens
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│      SFT        │  Supervised Fine-Tuning
+│                 │  Learns instruction-following
+└────────┬────────┘
+         │
+         ├─────────────────────┐
+         │                     │
+         ▼                     ▼
+┌─────────────────┐   ┌─────────────────┐
+│  Reward Model   │   │   DPO Training  │
+│   Training      │   │                 │
+│                 │   │  (Alternative   │
+│  Learn to rank  │   │   approach)     │
+│   responses     │   │                 │
+└────────┬────────┘   └────────┬────────┘
+         │                     │
+         ▼                     │
+┌─────────────────┐            │
+│  RLHF with PPO  │            │
+│                 │            │
+│  Optimize for   │            │
+│  preferences    │            │
+└────────┬────────┘            │
+         │                     │
+         ▼                     ▼
+┌──────────────────────────────┐
+│   Aligned Assistant Model    │
+│                              │
+│  Helpful, Harmless, Honest   │
+└──────────────────────────────┘
+```
+
+## Learning Modules
+
+### Module 1: Supervised Fine-Tuning (SFT)
+
+**The Foundation** - Start here!
+
+<CardGrid>
+  <Card title="What You'll Learn" icon="open-book">
+    - Instruction dataset formatting
+    - Loss masking for prompts vs completions
+    - LoRA for efficient training
+    - Training loops and optimization
+  </Card>
+
+  <Card title="Implementation" icon="laptop">
+    - `InstructionDataset` class
+    - Masked cross-entropy loss
+    - SFT trainer with LoRA
+    - Evaluation metrics
+  </Card>
+</CardGrid>
+
+**Key Concept:** SFT teaches the model to follow instructions by training on (prompt, completion) pairs with masked loss on prompts.
+
+**Time to Complete:** ~2-3 hours to understand, ~1 hour to train
+
+---
+
+### Module 2: Reward Modeling
+
+**Teaching Models to Judge** - Learn to predict human preferences
+
+<CardGrid>
+  <Card title="What You'll Learn" icon="open-book">
+    - Bradley-Terry preference model
+    - Preference dataset structure
+    - Reward model architecture
+    - Pairwise ranking loss
+  </Card>
+
+  <Card title="Implementation" icon="laptop">
+    - Preference dataset loader
+    - Reward head architecture
+    - Ranking loss function
+    - Evaluation on holdout preferences
+  </Card>
+</CardGrid>
+
+**Key Concept:** Reward models learn to predict which response humans prefer by training on (prompt, chosen, rejected) triples.
+
+**Time to Complete:** ~2 hours to understand, ~30 min to train
+
+---
+
+### Module 3: RLHF with PPO
+
+**The Classic Approach** - Used by GPT-4, Claude, and more
+
+<CardGrid>
+  <Card title="What You'll Learn" icon="open-book">
+    - Reinforcement learning basics
+    - PPO clipped objective
+    - KL divergence penalty
+    - Value network training
+    - Advantage estimation (GAE)
+  </Card>
+
+  <Card title="Implementation" icon="laptop">
+    - Rollout buffer for experience
+    - PPO loss with clipping
+    - Value network architecture
+    - Reference model freezing
+    - Complete training loop
+  </Card>
+</CardGrid>
+
+**Key Concept:** RLHF uses RL to optimize a language model against a learned reward model, with KL penalty to prevent distribution shift.
+
+**Time to Complete:** ~4-5 hours to understand, ~2 hours to train
+
+---
+
+### Module 4: Direct Preference Optimization (DPO)
+
+**The Modern Alternative** - Simpler and more stable
+
+<CardGrid>
+  <Card title="What You'll Learn" icon="open-book">
+    - DPO theoretical foundation
+    - Implicit reward modeling
+    - Why DPO avoids RL instability
+    - DPO vs RLHF tradeoffs
+  </Card>
+
+  <Card title="Implementation" icon="laptop">
+    - DPO loss function
+    - Reference model usage
+    - Log probability computation
+    - Preference dataset training
+  </Card>
+</CardGrid>
+
+**Key Concept:** DPO directly optimizes preferences without a reward model by deriving an analytical solution to the RLHF objective.
+
+**Time to Complete:** ~2-3 hours to understand, ~1 hour to train
+
+---
+
+## Code Structure
+
+The repository is organized for maximum educational value:
+
+```
+autotune/
+├── src/auto_bot_tuner/
+│   ├── sft/              # Supervised Fine-Tuning
+│   │   ├── dataset.py    # Instruction formatting
+│   │   ├── loss.py       # Masked cross-entropy
+│   │   └── trainer.py    # SFT training loop
+│   │
+│   ├── dpo/              # Direct Preference Optimization
+│   │   ├── dataset.py    # Preference pairs
+│   │   ├── loss.py       # DPO loss function
+│   │   └── trainer.py    # DPO training loop
+│   │
+│   ├── rlhf/             # RLHF with PPO
+│   │   ├── reward_model.py      # Reward model architecture
+│   │   ├── value_network.py     # Value function
+│   │   ├── ppo_loss.py          # PPO clipped objective
+│   │   ├── rollout_buffer.py    # Experience storage
+│   │   └── ppo_trainer.py       # Complete RLHF pipeline
+│   │
+│   ├── evaluation/       # Metrics and evaluation
+│   │   ├── metrics.py    # Perplexity, accuracy, etc.
+│   │   └── generation.py # Text generation utilities
+│   │
+│   └── utils/            # Shared utilities
+│       └── model_loading.py  # Model/tokenizer loading
+│
+├── commands/             # CLI command handlers
+├── configs/              # Training configurations
+├── tests/                # 210 comprehensive tests
+└── docs/                 # This documentation!
+```
+
+### Educational Code Design
+
+Every implementation follows these principles:
+
+1. **Clarity over performance** - Readable code with educational comments
+2. **Mathematical documentation** - Formulas and "why" explanations
+3. **Comprehensive testing** - 210 tests verifying correctness
+4. **Type annotations** - Clear interfaces throughout
+5. **Minimal dependencies** - Focus on core PyTorch concepts
+
+## Technical Requirements
+
+### Hardware Options
+
+<Tabs>
+  <TabItem label="NVIDIA GPU (Recommended)">
+    **Minimum:** 8GB VRAM (GTX 1080, RTX 2070, etc.)
+    - Can train GPT-2 (124M params) with LoRA
+    - Batch size: 4-8
+
+    **Recommended:** 24GB VRAM (RTX 3090, RTX 4090, A5000)
+    - Can train Llama 3.2 1B with LoRA
+    - Batch size: 16-32
+
+    **Ideal:** 40GB+ VRAM (A100, H100)
+    - Can train larger models
+    - Full fine-tuning possible
+</TabItem>
+
+  <TabItem label="AMD GPU (ROCm)">
+    **Supported on Linux with ROCm 5.7+**
+
+    Similar VRAM requirements to NVIDIA:
+    - 8GB: GPT-2 with LoRA
+    - 16GB+: Llama 3.2 1B with LoRA
+
+    Installation: `make install-rocm`
+</TabItem>
+
+  <TabItem label="CPU Only">
+    **Possible but slow**
+
+    - Training takes ~10-50x longer
+    - Suitable for small models (GPT-2)
+    - Good for learning concepts
+    - Not recommended for production
+</TabItem>
+</Tabs>
+
+### Software Requirements
+
+- **Python:** 3.12+ (3.13 not yet supported by some deps)
+- **PyTorch:** 2.0+ (installed automatically)
+- **UV:** Fast package manager (replaces pip)
+- **CUDA:** 11.8+ for NVIDIA GPUs
+- **ROCm:** 5.7+ for AMD GPUs (Linux only)
+
+## Training Time Estimates
+
+With 24GB VRAM (RTX 3090/4090):
+
+| Method | Model | Dataset Size | Time | Cost |
+|--------|-------|--------------|------|------|
+| **SFT** | GPT-2 | 50K examples | ~1 hour | Free |
+| **SFT** | Llama 3.2 1B | 50K examples | ~3 hours | Free |
+| **Reward Model** | GPT-2 | 10K pairs | ~30 min | Free |
+| **DPO** | GPT-2 | 10K pairs | ~1 hour | Free |
+| **RLHF** | GPT-2 | 10K prompts | ~2 hours | Free |
+
+All training is done locally - no cloud costs!
+
+## Datasets We'll Use
+
+### For SFT:
+- **Alpaca** (52K instruction-response pairs)
+- **Dolly** (15K high-quality examples)
+- **OpenAssistant** (161K conversations)
+
+### For Preference Learning:
+- **Anthropic HH-RLHF** (170K preference pairs)
+- **Stanford SHP** (385K Reddit preferences)
+- **OpenAssistant Rankings** (161K with rankings)
+
+All datasets are freely available on Hugging Face! 🤗
+
+## What Makes This Educational?
+
+### 1. Comprehensive Documentation
+
+Every technique is explained at three levels:
+- **Intuitive:** What is this doing and why?
+- **Mathematical:** Formal definitions and derivations
+- **Practical:** How to implement and tune
+
+### 2. Progressive Complexity
+
+Start simple, add sophistication:
+- Begin with basic SFT
+- Add LoRA for efficiency
+- Move to preference learning
+- Master full RLHF pipeline
+
+### 3. Extensive Code Comments
+
+The code teaches you:
+```python
+def compute_dpo_loss(...):
+    """
+    Educational Note:
+        The DPO loss is derived from the Bradley-Terry model.
+        It implicitly defines a reward function as:
+            r(x, y) = beta * log(π_θ(y|x) / π_ref(y|x))
+
+        Formula: L_DPO = -log(σ(beta * (log_ratio_chosen - log_ratio_rejected)))
+        ...
+    """
+```
+
+### 4. Complete Testing
+
+210 tests ensure correctness:
+- Unit tests for each component
+- Integration tests for training
+- Mathematical property tests
+- Edge case validation
+
+## Learning Path
+
+We recommend this order:
+
+1. **Start:** [Why Post-Training Matters](/why-post-training/)
+2. **Foundation:** [Supervised Fine-Tuning](/sft/)
+3. **Preferences:** [Reward Modeling](/reward/)
+4. **Advanced:** [RLHF](/rlhf/) or [DPO](/dpo/)
+5. **Practice:** [Try It Yourself](/try-it/)
+
+Each module builds on previous concepts, but you can jump around if you have background knowledge.
+
+## Community and Support
+
+- **GitHub:** [zhubert/autotune](https://github.com/zhubert/autotune)
+- **Issues:** Report bugs or ask questions
+- **Discussions:** Share your results and learnings
+
+## Credits and References
+
+This project synthesizes research from:
+
+- **InstructGPT** (OpenAI, 2022) - RLHF at scale
+- **DPO** (Rafailov et al., 2023) - Direct preference optimization
+- **LoRA** (Hu et al., 2021) - Efficient fine-tuning
+- **PPO** (Schulman et al., 2017) - Stable RL algorithm
+- **Constitutional AI** (Anthropic, 2022) - AI-generated preferences
+
+Full bibliography in each module.
+
+---
+
+Ready to start? Let's begin with [Supervised Fine-Tuning](/sft/)! 🚀

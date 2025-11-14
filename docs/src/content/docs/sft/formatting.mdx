@@ -1,0 +1,548 @@
+---
+title: Instruction Formatting
+description: How to structure and format instruction data for effective SFT
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+## Why Formatting Matters
+
+The way you format instructions dramatically affects what the model learns. Consider these two approaches:
+
+<Tabs>
+  <TabItem label="Poor Formatting">
+```
+instruction: What is the capital of France?
+answer: Paris
+```
+
+Model learns to predict "Paris" but doesn't understand the conversational structure.
+</TabItem>
+
+  <TabItem label="Good Formatting">
+```
+### Instruction:
+What is the capital of France?
+
+### Response:
+The capital of France is Paris.
+```
+
+Model learns both the task AND the conversational format.
+</TabItem>
+</Tabs>
+
+**The formatting teaches the model how to interact**, not just what to say.
+
+## Common Instruction Formats
+
+### 1. Alpaca Format
+
+The most widely used format for single-turn instructions:
+
+```
+### Instruction:
+{instruction text}
+
+### Input:
+{optional context or input}
+
+### Response:
+{expected response}
+```
+
+**When to use:**
+- Single-turn question answering
+- Task completion (summarization, classification, etc.)
+- Simple instruction following
+
+**Example:**
+
+```
+### Instruction:
+Summarize the following article in one sentence.
+
+### Input:
+Quantum computers use quantum-mechanical phenomena such as
+superposition and entanglement to perform computation. Unlike
+classical computers that use bits, quantum computers use
+quantum bits or qubits.
+
+### Response:
+Quantum computers leverage quantum phenomena like superposition
+and entanglement using qubits instead of classical bits.
+```
+
+### 2. Chat Format
+
+For multi-turn conversations:
+
+```
+User: What is machine learning?
+Assistant: Machine learning is a field of AI that enables computers to learn from data.
+User: Can you give an example?
+Assistant: Sure! Email spam filters learn to identify spam by analyzing thousands of labeled emails.
+```
+
+**When to use:**
+- Multi-turn dialogues
+- Conversational AI assistants
+- Context-dependent responses
+- Chat applications
+
+**Example:**
+
+```
+User: I'm planning a trip to Japan.
+Assistant: That's exciting! How long are you planning to stay?
+User: About two weeks in spring.
+Assistant: Spring is beautiful in Japan! You'll catch the cherry blossoms.
+I recommend visiting Tokyo, Kyoto, and Osaka. Would you like help
+planning an itinerary?
+```
+
+### 3. System Prompts
+
+System prompts set the behavior and personality of the model:
+
+```
+System: You are a helpful assistant that provides concise technical answers.
+User: What is a binary search tree?
+Assistant: A binary search tree (BST) is a data structure where each node has at most two children, with left children smaller and right children larger than the parent. This enables O(log n) search time.
+```
+
+**When to use:**
+- Setting model behavior (helpful, concise, technical, etc.)
+- Domain-specific instructions (medical, legal, coding)
+- Safety guidelines and boundaries
+
+## Implementation in InstructionDataset
+
+The `InstructionDataset` class in `/home/user/autotune/src/auto_bot_tuner/sft/dataset.py` implements format handling automatically. Let's explore how it works.
+
+### Auto-Detection
+
+The dataset automatically detects format types:
+
+```python
+# From src/auto_bot_tuner/sft/dataset.py:66-76
+if self.format_type == "alpaca":
+    prompt, response = self._format_alpaca(item)
+elif self.format_type == "chat":
+    prompt, response = self._format_chat(item)
+else:
+    # Auto-detect format
+    if "messages" in item:
+        prompt, response = self._format_chat(item)
+    elif "instruction" in item:
+        prompt, response = self._format_alpaca(item)
+```
+
+<Aside type="tip">
+Use `format_type="auto"` to automatically detect whether your dataset uses Alpaca or Chat format based on field names.
+</Aside>
+
+### Alpaca Formatting
+
+The Alpaca formatter creates structured prompts:
+
+```python
+# From src/auto_bot_tuner/sft/dataset.py:106-127
+def _format_alpaca(self, item: Dict) -> tuple[str, str]:
+    """
+    Format Alpaca-style instruction data.
+
+    Returns:
+        (prompt, response) tuple
+    """
+    instruction = item["instruction"]
+    input_text = item.get("input", "")
+    output = item["output"]
+
+    if input_text:
+        prompt = f"### Instruction:\n{instruction}\n\n### Input:\n{input_text}\n\n### Response:\n"
+    else:
+        prompt = f"### Instruction:\n{instruction}\n\n### Response:\n"
+
+    return prompt, output
+```
+
+**Key insights:**
+1. The `### Response:\n` marker is included in the prompt
+2. Only the actual response text is masked differently (see [Loss Masking](./loss-masking))
+3. The `input` field is optional - if empty, it's omitted
+
+### Chat Formatting
+
+The chat formatter handles multi-turn conversations:
+
+```python
+# From src/auto_bot_tuner/sft/dataset.py:129-164
+def _format_chat(self, item: Dict) -> tuple[str, str]:
+    """
+    Format chat-style messages.
+
+    Returns:
+        (prompt, response) tuple where prompt includes all messages
+        except the last assistant message
+    """
+    messages = item["messages"]
+
+    # Build prompt from all messages except last assistant response
+    prompt_parts = []
+    response = ""
+
+    for msg in messages:
+        role = msg["role"]
+        content = msg["content"]
+
+        if role == "user":
+            prompt_parts.append(f"User: {content}")
+        elif role == "assistant":
+            if msg == messages[-1]:
+                # This is the target response
+                response = content
+            else:
+                # Previous assistant messages are part of context
+                prompt_parts.append(f"Assistant: {content}")
+        elif role == "system":
+            prompt_parts.append(f"System: {content}")
+
+    prompt = "\n\n".join(prompt_parts) + "\n\nAssistant: "
+
+    return prompt, response
+```
+
+**Key insights:**
+1. Only the **last** assistant message is the training target
+2. Previous assistant messages become part of the context
+3. System messages are included at the start
+4. Messages are separated by double newlines for clarity
+
+## Chat Templates vs Manual Formatting
+
+Modern tokenizers include **chat templates** - built-in formatting functions:
+
+<Tabs>
+  <TabItem label="Manual Formatting (Our Approach)">
+```python
+# Explicit control over format
+prompt = f"### Instruction:\n{instruction}\n\n### Response:\n"
+```
+
+**Pros:**
+- Full control over exact format
+- Consistent across all models
+- Easy to understand and debug
+- Educational value
+</TabItem>
+
+  <TabItem label="Chat Templates (Alternative)">
+```python
+# Using tokenizer's built-in template
+messages = [
+    {"role": "user", "content": "Hello!"},
+    {"role": "assistant", "content": "Hi there!"}
+]
+prompt = tokenizer.apply_chat_template(messages)
+```
+
+**Pros:**
+- Model-specific optimal format
+- Handles special tokens automatically
+- Less code to maintain
+</TabItem>
+</Tabs>
+
+<Aside type="note">
+This tutorial uses **manual formatting** for educational clarity. In production, consider using chat templates when available.
+</Aside>
+
+## Understanding Tokenization
+
+After formatting, the text must be converted to tokens:
+
+```python
+# From src/auto_bot_tuner/sft/dataset.py:78-83
+# Tokenize prompt and response separately to create proper labels
+prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=True)
+response_ids = self.tokenizer.encode(response, add_special_tokens=False)
+
+# Combine and truncate if necessary
+total_ids = prompt_ids + response_ids + [self.tokenizer.eos_token_id]
+```
+
+**Why tokenize separately?**
+
+1. **Prompt gets special tokens** (`add_special_tokens=True`) - typically a BOS (beginning of sequence) token
+2. **Response doesn't** (`add_special_tokens=False`) - we don't want a BOS in the middle
+3. **EOS token added at the end** - signals completion
+
+### Token Budget Management
+
+Each model has a maximum sequence length:
+
+```python
+# From src/auto_bot_tuner/sft/dataset.py:84-88
+if len(total_ids) > self.max_length:
+    # Truncate from the response, keep full prompt if possible
+    overflow = len(total_ids) - self.max_length
+    response_ids = response_ids[:-overflow] if len(prompt_ids) < self.max_length else response_ids
+    total_ids = (prompt_ids + response_ids + [self.tokenizer.eos_token_id])[:self.max_length]
+```
+
+**Truncation strategy:**
+- Try to keep the full prompt (the instruction)
+- Truncate the response if necessary
+- This ensures the model always sees the full task description
+
+<Aside type="caution">
+If prompts are longer than `max_length`, even they will be truncated. Keep prompts concise!
+</Aside>
+
+## Padding and Attention Masks
+
+Models process batches of sequences, which must have uniform length:
+
+```python
+# From src/auto_bot_tuner/sft/dataset.py:95-98
+# Pad to max_length
+input_ids = total_ids + [self.tokenizer.pad_token_id] * (self.max_length - len(total_ids))
+attention_mask = [1] * len(total_ids) + [0] * (self.max_length - len(total_ids))
+labels = labels + [-100] * (self.max_length - len(labels))
+```
+
+**Three parallel arrays:**
+
+1. **input_ids**: Token IDs with padding
+2. **attention_mask**: 1 for real tokens, 0 for padding
+3. **labels**: Target tokens with -100 for ignored positions
+
+Example:
+
+```
+Text:        "Hello world" <PAD> <PAD>
+input_ids:   [15496, 995]  [50256, 50256]
+attention:   [1,     1  ]  [0,     0    ]
+labels:      [15496, 995]  [-100,  -100 ]
+```
+
+The attention mask tells the model which tokens to attend to.
+
+## Preview Function
+
+Debug your formatting with `preview_formatted_sample`:
+
+```python
+from src.auto_bot_tuner.sft.dataset import preview_formatted_sample
+
+# See what your data looks like after formatting
+preview = preview_formatted_sample(dataset, idx=0, decode=True)
+print(preview["full_text"])           # Complete sequence
+print(preview["response_only"])       # Just the target response
+print(preview["num_prompt_tokens"])   # How many tokens are masked
+print(preview["num_response_tokens"]) # How many tokens are trained
+```
+
+This is invaluable for debugging formatting issues!
+
+## Best Practices
+
+### 1. Consistency is Critical
+
+**Bad:** Mixing formats randomly
+```
+Sample 1: "### Instruction: ..."
+Sample 2: "Instruction: ..."  # Missing ###
+Sample 3: "Question: ..."     # Different marker
+```
+
+**Good:** Stick to one format
+```
+Sample 1: "### Instruction: ..."
+Sample 2: "### Instruction: ..."
+Sample 3: "### Instruction: ..."
+```
+
+The model needs to learn **one consistent pattern**, not multiple variants.
+
+### 2. Clear Delimiters
+
+Use clear, distinctive markers:
+
+**Bad:**
+```
+instruction: What is Python?
+response: Python is a programming language.
+```
+
+**Good:**
+```
+### Instruction:
+What is Python?
+
+### Response:
+Python is a programming language.
+```
+
+The newlines and `###` markers make boundaries unambiguous.
+
+### 3. Prompt Length Budget
+
+Keep prompts under 25% of max_length:
+
+```python
+# If max_length=512, keep prompts under 128 tokens
+# This leaves room for responses and reduces truncation
+```
+
+### 4. Response Completeness
+
+Ensure responses are complete sentences:
+
+**Bad:**
+```
+### Response:
+Python is a prog...  # Truncated mid-word
+```
+
+**Good:**
+```
+### Response:
+Python is a programming language used for web development, data analysis, and more.
+```
+
+### 5. Dataset Quality > Quantity
+
+**1,000 high-quality examples** with:
+- Clear instructions
+- Complete responses
+- Correct grammar
+- Diverse tasks
+
+Is worth more than **10,000 noisy examples** with:
+- Ambiguous instructions
+- Incomplete responses
+- Errors and typos
+- Repetitive content
+
+### 6. Test Your Format
+
+Always preview samples before training:
+
+```python
+from src.auto_bot_tuner.sft.dataset import InstructionDataset, preview_formatted_sample
+from transformers import AutoTokenizer
+from datasets import load_dataset
+
+# Load and format
+tokenizer = AutoTokenizer.from_pretrained("gpt2")
+raw_data = load_dataset("yahma/alpaca-cleaned", split="train[:10]")
+dataset = InstructionDataset(raw_data, tokenizer, max_length=512)
+
+# Preview first 3 samples
+for i in range(3):
+    preview = preview_formatted_sample(dataset, idx=i, decode=True)
+    print(f"\n{'='*60}")
+    print(f"Sample {i}:")
+    print(f"{'='*60}")
+    print(preview["full_text"])
+    print(f"\nResponse tokens: {preview['num_response_tokens']}")
+    print(f"Prompt tokens: {preview['num_prompt_tokens']}")
+```
+
+This catches formatting issues before you waste GPU time!
+
+## Common Pitfalls
+
+### Pitfall 1: Inconsistent Newlines
+
+```python
+# This causes problems - inconsistent spacing
+prompt1 = "### Instruction:\nWhat is AI?\n### Response:\n"
+prompt2 = "### Instruction:\n\nWhat is AI?\n\n### Response:\n"  # Extra newlines
+```
+
+**Solution:** Use consistent newline patterns throughout your dataset.
+
+### Pitfall 2: Missing EOS Tokens
+
+```python
+# Bad - no EOS token signals when response ends
+total_ids = prompt_ids + response_ids
+
+# Good - EOS tells model response is complete
+total_ids = prompt_ids + response_ids + [tokenizer.eos_token_id]
+```
+
+### Pitfall 3: Special Token Confusion
+
+```python
+# Bad - adds BOS token in middle of sequence
+prompt_ids = tokenizer.encode(prompt, add_special_tokens=True)
+response_ids = tokenizer.encode(response, add_special_tokens=True)  # ❌
+
+# Good - only one BOS at start
+prompt_ids = tokenizer.encode(prompt, add_special_tokens=True)
+response_ids = tokenizer.encode(response, add_special_tokens=False)  # ✓
+```
+
+### Pitfall 4: Ignoring Truncation
+
+```python
+# Many examples get truncated - you never notice
+# because you didn't check!
+
+# Always log truncation statistics:
+truncated = sum(1 for item in dataset if len(item["input_ids"]) == max_length)
+print(f"Truncated samples: {truncated}/{len(dataset)} ({100*truncated/len(dataset):.1f}%)")
+```
+
+If >10% are truncated, increase `max_length` or shorten prompts!
+
+## Advanced: Custom Formats
+
+You can extend `InstructionDataset` for custom formats:
+
+```python
+class CustomInstructionDataset(InstructionDataset):
+    def _format_custom(self, item: Dict) -> tuple[str, str]:
+        """
+        Custom format for domain-specific data.
+        """
+        # Example: Code review format
+        code = item["code"]
+        issue = item["issue"]
+        fix = item["fix"]
+
+        prompt = f"### Code:\n{code}\n\n### Issue:\n{issue}\n\n### Fix:\n"
+        response = fix
+
+        return prompt, response
+
+    def __getitem__(self, idx: int):
+        item = self.dataset[idx]
+
+        # Use custom formatter
+        prompt, response = self._format_custom(item)
+
+        # Rest of processing is same as parent class
+        # ... tokenization, masking, padding ...
+```
+
+This flexibility lets you adapt to any dataset structure!
+
+## Summary
+
+Instruction formatting is about teaching the model **structure**, not just content:
+
+1. **Use consistent markers** (`### Instruction:`, `### Response:`)
+2. **Separate prompt from response** for proper loss masking
+3. **Handle special tokens carefully** (BOS at start, EOS at end)
+4. **Manage token budgets** (keep prompts short, allow room for responses)
+5. **Preview your data** before training (catch issues early)
+
+The `InstructionDataset` class handles these details automatically, but understanding the **why** helps you debug issues and adapt to new formats.
+
+**Next:** Learn about [Loss Masking](./loss-masking) to understand why we only train on responses, not prompts.
+

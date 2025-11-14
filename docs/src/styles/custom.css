@@ -1,0 +1,17 @@
+/* Custom styles for post-training documentation */
+
+:root {
+  --sl-color-accent: hsl(210, 100%, 60%);
+  --sl-color-accent-high: hsl(210, 100%, 70%);
+}
+
+/* Code blocks */
+pre {
+  border-radius: 8px;
+}
+
+/* Enhanced tables */
+table {
+  border-radius: 8px;
+  overflow: hidden;
+}

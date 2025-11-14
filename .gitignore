@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+
+# PyTorch
+*.pt
+*.pth
+*.ckpt
+!checkpoints/.gitkeep
+
+# Project specific
+checkpoints/*
+!checkpoints/.gitkeep
+models/*
+!models/.gitkeep
+data/*
+!data/.gitkeep
+
+# Jupyter
+.ipynb_checkpoints
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Documentation
+docs/node_modules/
+docs/.astro/
+docs/dist/
+
+# Logs
+*.log
+wandb/

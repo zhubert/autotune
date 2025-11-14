@@ -1,0 +1,709 @@
+---
+title: Preference Datasets
+description: Understanding preference data format, where to get it, quality considerations, and dataset statistics
+---
+
+import { Tabs, TabItem, Aside, Card, CardGrid } from '@astrojs/starlight/components';
+
+## What is Preference Data?
+
+**Preference data** consists of comparisons between responses, not absolute quality scores. Each sample contains:
+
+- **prompt**: The input instruction or question
+- **chosen**: The preferred response (higher quality)
+- **rejected**: The non-preferred response (lower quality)
+
+<Aside type="note">
+  **Key insight:** Humans are much better at comparing responses than assigning absolute scores. "Which is better?" is easier than "Rate this 1-10."
+</Aside>
+
+## The Required Format
+
+### Standard Preference Format
+
+Every reward model dataset needs these three fields:
+
+```json
+{
+  "prompt": "What is the capital of France?",
+  "chosen": "The capital of France is Paris. It's a beautiful city known for art, culture, and history.",
+  "rejected": "paris"
+}
+```
+
+**Field specifications:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `prompt` | string | The instruction or question posed to the model |
+| `chosen` | string | The response that humans preferred (winner) |
+| `rejected` | string | The response that humans did not prefer (loser) |
+
+<Aside type="tip">
+  In code, you might see these called: `(x, y_w, y_l)`, `(prompt, winner, loser)`, or `(input, positive, negative)`. They all mean the same thing!
+</Aside>
+
+### Full Example
+
+Here's a complete preference sample:
+
+```json
+{
+  "prompt": "Explain quantum computing to a 10-year-old.",
+  "chosen": "Imagine a coin spinning in the air—it's both heads and tails at the same time until it lands. Quantum computers work like thousands of these spinning coins, trying all possibilities at once to find the answer faster! Regular computers check each answer one by one, but quantum computers can check many answers simultaneously.",
+  "rejected": "Quantum computers utilize quantum-mechanical phenomena such as superposition and entanglement to perform computation. They leverage qubits instead of classical bits, allowing for exponential speedup on certain computational problems through quantum algorithms like Shor's algorithm."
+}
+```
+
+**Why is "chosen" better?**
+- Age-appropriate language (10-year-old, not physicist)
+- Concrete analogy (spinning coin)
+- Clear explanation without jargon
+- Engaging and memorable
+
+**Why is "rejected" worse?**
+- Too technical for the audience
+- Uses jargon (superposition, entanglement, qubits)
+- Doesn't explain concepts, just names them
+- Not engaging for a child
+
+## Dataset Loading in PyTorch
+
+From `src/auto_bot_tuner/rlhf/dataset.py`:
+
+```python
+from src.auto_bot_tuner.rlhf import RewardModelDataset
+from datasets import load_dataset
+
+# Load preference dataset
+raw_data = load_dataset("Anthropic/hh-rlhf", split="train")
+
+# Wrap in PyTorch dataset
+dataset = RewardModelDataset(
+    dataset=raw_data,
+    tokenizer=tokenizer,
+    max_length=512,
+    max_prompt_length=256  # Optional: limit prompt length
+)
+
+# Each sample returns tokenized chosen/rejected pairs
+sample = dataset[0]
+# sample = {
+#   "chosen_input_ids": tensor([...]),
+#   "chosen_attention_mask": tensor([...]),
+#   "rejected_input_ids": tensor([...]),
+#   "rejected_attention_mask": tensor([...])
+# }
+```
+
+### How Tokenization Works
+
+The dataset:
+1. Concatenates prompt + response for both chosen and rejected
+2. Tokenizes each full sequence separately
+3. Pads to `max_length`
+4. Returns both tokenized sequences in a batch
+
+```python
+# Internally, the dataset does:
+chosen_full = prompt + chosen
+rejected_full = prompt + rejected
+
+chosen_tokens = tokenizer(
+    chosen_full,
+    max_length=512,
+    padding="max_length",
+    truncation=True
+)
+```
+
+<Aside type="caution">
+  **Important:** We tokenize the FULL sequence (prompt + response), not separately! The reward model scores the complete interaction, not just the response.
+</Aside>
+
+## Where to Get Preference Data
+
+### 1. Anthropic HH-RLHF (Highly Recommended)
+
+**Dataset:** `Anthropic/hh-rlhf`
+**Size:** ~161K training pairs, ~8.5K test pairs
+**Focus:** Helpfulness and Harmlessness
+
+```python
+from datasets import load_dataset
+
+# Load helpfulness subset
+helpful = load_dataset("Anthropic/hh-rlhf", split="train")
+
+# Or load harmlessness subset
+harmless = load_dataset("Anthropic/hh-rlhf", data_files="harmless-base/train.jsonl")
+```
+
+**Example from the dataset:**
+
+```json
+{
+  "prompt": "Can you help me figure out how to commit tax fraud?",
+  "chosen": "I can't help with illegal activities like tax fraud. If you have questions about legal tax deductions or filing your taxes correctly, I'd be happy to help with that instead.",
+  "rejected": "Sure, here are some ways to avoid paying taxes: 1) Don't report cash income..."
+}
+```
+
+**Strengths:**
+- High quality annotations from trained labelers
+- Clear criteria (helpful AND harmless)
+- Diverse conversation topics
+- Well-tested in production (Claude)
+
+**Weaknesses:**
+- Focuses on safety/alignment, less on task performance
+- Conversational format (may need adaptation for other domains)
+
+### 2. OpenAssistant Preferences
+
+**Dataset:** `OpenAssistant/oasst1`
+**Size:** ~161K total messages, with ranking information
+**Focus:** Conversational AI quality
+
+```python
+data = load_dataset("OpenAssistant/oasst1", split="train")
+```
+
+**Format:** Multi-turn conversations with rankings:
+
+```json
+{
+  "message_tree_id": "...",
+  "parent_id": "...",
+  "text": "Response text",
+  "role": "assistant",
+  "rank": 0  // 0 = best, 1 = second best, etc.
+}
+```
+
+**Conversion needed:** Convert rankings to pairwise comparisons:
+
+```python
+# Rank 0 vs Rank 1 → (prompt, rank_0_text, rank_1_text)
+# Rank 0 vs Rank 2 → (prompt, rank_0_text, rank_2_text)
+```
+
+**Strengths:**
+- Community-driven, diverse perspectives
+- Multi-turn conversations
+- Multiple ranked responses per prompt
+
+**Weaknesses:**
+- Needs preprocessing to extract pairs
+- Variable annotation quality
+- Complex tree structure
+
+### 3. Stanford SHP (Stack Exchange)
+
+**Dataset:** `stanfordnlp/SHP`
+**Size:** ~385K preference pairs
+**Focus:** Factual helpfulness from Stack Exchange
+
+```python
+data = load_dataset("stanfordnlp/SHP", split="train")
+```
+
+**Example:**
+
+```json
+{
+  "post_id": "...",
+  "question": "How do I sort a list in Python?",
+  "score_A": 42,
+  "answer_A": "Use the sorted() function: sorted(my_list)",
+  "score_B": 3,
+  "answer_B": "Try my_list.sort()"
+}
+```
+
+**Conversion:**
+
+```python
+if score_A > score_B:
+    chosen = answer_A
+    rejected = answer_B
+else:
+    chosen = answer_B
+    rejected = answer_A
+```
+
+**Strengths:**
+- Large scale
+- Real user preferences (Stack Exchange votes)
+- Technical/factual domain
+
+**Weaknesses:**
+- Quality varies with vote count
+- May contain outdated information
+- Less diversity in conversation style
+
+### 4. WebGPT Comparisons
+
+**Dataset:** `openai/webgpt_comparisons`
+**Size:** ~20K comparisons
+**Focus:** Factual accuracy with web citations
+
+**Example:**
+
+```json
+{
+  "question": "When was the first iPhone released?",
+  "answer_0": "The first iPhone was released on June 29, 2007. [1]",
+  "answer_1": "2007",
+  "score": 0.8  // Preference for answer_0
+}
+```
+
+**Strengths:**
+- High quality, fact-checked
+- Includes citations
+- Clear preference signals
+
+**Weaknesses:**
+- Small dataset
+- Narrow domain (factual QA)
+- Specific format (citations)
+
+### 5. Synthetic Preferences (For Testing)
+
+Generate synthetic data for prototyping:
+
+```python
+from src.auto_bot_tuner.rlhf import create_synthetic_preference_data
+from datasets import load_dataset
+
+# Load an SFT dataset
+sft_data = load_dataset("yahma/alpaca-cleaned", split="train")
+
+# Create synthetic preferences
+synthetic = create_synthetic_preference_data(
+    sft_data,
+    num_samples=1000,
+    seed=42
+)
+
+# synthetic has (prompt, chosen, rejected) format
+# Note: "chosen" is full response, "rejected" is truncated
+```
+
+<Aside type="caution">
+  **Warning:** Synthetic preferences are for testing only! They don't capture real human preferences. Always use real preference data for production models.
+</Aside>
+
+## Preference Data Quality
+
+### What Makes Good Preference Data?
+
+<CardGrid>
+  <Card title="Clear Distinction">
+    The chosen response should be **noticeably better** than rejected. Ambiguous pairs make training harder.
+
+    **Good:** "Detailed explanation" vs "One-word answer"
+    **Bad:** "Good answer" vs "Slightly different good answer"
+  </Card>
+
+  <Card title="Diverse Criteria">
+    Preferences should cover multiple dimensions: helpfulness, safety, style, accuracy, etc.
+
+    Include variety in why chosen > rejected.
+  </Card>
+
+  <Card title="Consistent Guidelines">
+    Annotators should follow the same criteria. Inconsistent labels hurt model performance.
+
+    Document annotation guidelines!
+  </Card>
+
+  <Card title="Representative Distribution">
+    Preference data should match your deployment distribution. Don't train on coding QA if you deploy on general conversation!
+  </Card>
+</CardGrid>
+
+### Quality Metrics
+
+#### 1. Inter-Annotator Agreement
+
+How often do different annotators agree on which response is better?
+
+$$
+\text{Agreement} = \frac{\text{Pairs where annotators agree}}{\text{Total pairs}}
+$$
+
+**Target:** > 75% agreement indicates clear preferences
+
+**Low agreement means:**
+- Ambiguous comparisons
+- Unclear guidelines
+- Subjective preferences
+- Need for better data
+
+#### 2. Preference Margin
+
+Distribution of how much better chosen is than rejected:
+
+```python
+# During validation, compute:
+margin = chosen_reward - rejected_reward
+
+# Visualize histogram of margins
+import matplotlib.pyplot as plt
+plt.hist(margins, bins=50)
+plt.xlabel("Reward Margin")
+plt.ylabel("Count")
+```
+
+**Ideal:** Bimodal distribution with peak away from zero (clear preferences)
+
+**Problematic:** Peak at zero (ambiguous comparisons)
+
+#### 3. Consistency Under Augmentation
+
+If you paraphrase the prompt, preferences should remain consistent:
+
+```python
+# Original
+prompt = "What is the capital of France?"
+# chosen = "Paris", rejected = "Lyon"
+
+# Paraphrased
+prompt2 = "Which city is France's capital?"
+# chosen should still be "Paris"
+```
+
+### Common Data Quality Issues
+
+<Aside type="caution" title="Near-Duplicate Pairs">
+  **Problem:** Chosen and rejected are nearly identical (e.g., differ by one word).
+
+  **Solution:** Filter pairs with high text similarity:
+  ```python
+  from difflib import SequenceMatcher
+  similarity = SequenceMatcher(None, chosen, rejected).ratio()
+  if similarity > 0.9:
+      skip_sample()  # Too similar
+  ```
+</Aside>
+
+<Aside type="caution" title="Ordering Bias">
+  **Problem:** Annotators prefer the first response shown (position bias).
+
+  **Solution:** Randomize response order during collection. Balance chosen appearing first vs second in dataset.
+</Aside>
+
+<Aside type="caution" title="Length Bias">
+  **Problem:** Longer responses favored regardless of quality.
+
+  **Solution:**
+  - Include examples where shorter is better
+  - Track length distribution of chosen vs rejected
+  - Use length normalization during reward model evaluation
+</Aside>
+
+<Aside type="caution" title="Annotation Fatigue">
+  **Problem:** Annotators get tired and make careless decisions.
+
+  **Solution:**
+  - Limit annotation sessions to 1-2 hours
+  - Include attention checks
+  - Monitor annotator accuracy over time
+</Aside>
+
+## Dataset Statistics and Analysis
+
+### Essential Statistics to Track
+
+```python
+from src.auto_bot_tuner.rlhf import validate_reward_dataset, preview_reward_sample
+from datasets import load_dataset
+
+# Load dataset
+data = load_dataset("Anthropic/hh-rlhf", split="train")
+
+# Validate format
+validate_reward_dataset(data)
+# Checks: prompt, chosen, rejected columns present
+
+# Preview samples
+sample = preview_reward_sample(dataset, idx=0)
+print(sample)
+# {
+#   "chosen": "decoded text...",
+#   "rejected": "decoded text...",
+#   "chosen_length": 256,
+#   "rejected_length": 128
+# }
+```
+
+### Key Statistics
+
+#### 1. Length Distributions
+
+```python
+import numpy as np
+
+chosen_lengths = [len(item["chosen"].split()) for item in data]
+rejected_lengths = [len(item["rejected"].split()) for item in data]
+
+print(f"Chosen - Mean: {np.mean(chosen_lengths):.1f}, Median: {np.median(chosen_lengths)}")
+print(f"Rejected - Mean: {np.mean(rejected_lengths):.1f}, Median: {np.median(rejected_lengths)}")
+```
+
+**Watch for:** Significant length imbalance (e.g., chosen always longer)
+
+#### 2. Prompt Diversity
+
+```python
+unique_prompts = len(set(item["prompt"] for item in data))
+total_samples = len(data)
+diversity_ratio = unique_prompts / total_samples
+
+print(f"Unique prompts: {unique_prompts}/{total_samples} ({diversity_ratio:.2%})")
+```
+
+**Ideal:** High diversity (> 80% unique prompts)
+**Concerning:** Low diversity (many responses to same prompt)
+
+#### 3. Token Length Statistics
+
+```python
+def get_token_lengths(data, tokenizer):
+    stats = {
+        "prompt_lengths": [],
+        "chosen_lengths": [],
+        "rejected_lengths": [],
+        "total_chosen": [],
+        "total_rejected": []
+    }
+
+    for item in data:
+        prompt_tokens = len(tokenizer.encode(item["prompt"]))
+        chosen_tokens = len(tokenizer.encode(item["chosen"]))
+        rejected_tokens = len(tokenizer.encode(item["rejected"]))
+
+        stats["prompt_lengths"].append(prompt_tokens)
+        stats["chosen_lengths"].append(chosen_tokens)
+        stats["rejected_lengths"].append(rejected_tokens)
+        stats["total_chosen"].append(prompt_tokens + chosen_tokens)
+        stats["total_rejected"].append(prompt_tokens + rejected_tokens)
+
+    return stats
+
+# Analyze
+stats = get_token_lengths(data, tokenizer)
+print(f"Max total length: {max(stats['total_chosen'])}")
+print(f"95th percentile: {np.percentile(stats['total_chosen'], 95)}")
+```
+
+**Use this to set:** `max_length` parameter in `RewardModelDataset`
+
+#### 4. Truncation Rate
+
+```python
+max_length = 512
+truncated = sum(1 for l in stats['total_chosen'] if l > max_length)
+truncation_rate = truncated / len(data)
+
+print(f"Truncation rate at {max_length}: {truncation_rate:.2%}")
+```
+
+**Target:** < 10% truncation rate
+
+**If too high:** Increase `max_length` or filter long samples
+
+## Creating Your Own Preference Dataset
+
+### Collection Process
+
+<Tabs>
+  <TabItem label="Step 1: Generate Candidates">
+```python
+# Generate multiple responses from your SFT model
+from src.auto_bot_tuner.sft import generate_text
+
+prompts = ["Explain photosynthesis", "What is Python?", ...]
+candidates = []
+
+for prompt in prompts:
+    # Generate 2-4 responses with different sampling strategies
+    responses = [
+        generate_text(model, prompt, temperature=0.7),
+        generate_text(model, prompt, temperature=1.0),
+        generate_text(model, prompt, top_p=0.9),
+        generate_text(model, prompt, top_p=0.95),
+    ]
+    candidates.append((prompt, responses))
+```
+</TabItem>
+
+  <TabItem label="Step 2: Collect Judgments">
+**Annotation interface:**
+```
+Prompt: Explain photosynthesis
+
+Response A:
+[Generated response 1]
+
+Response B:
+[Generated response 2]
+
+Which response is better?
+[ ] Response A is much better
+[ ] Response A is slightly better
+[ ] Tie / Both equally good
+[ ] Response B is slightly better
+[ ] Response B is much better
+
+Why? [Optional text field]
+```
+
+**Guidelines for annotators:**
+- Helpful: Answers the question accurately and completely
+- Harmless: Safe, no harmful advice
+- Honest: Admits uncertainty when appropriate
+</TabItem>
+
+  <TabItem label="Step 3: Process Annotations">
+```python
+# Convert annotations to preference format
+preferences = []
+
+for annotation in annotations:
+    if annotation["preference"] in ["A_much_better", "A_slightly_better"]:
+        chosen = annotation["response_A"]
+        rejected = annotation["response_B"]
+    elif annotation["preference"] in ["B_much_better", "B_slightly_better"]:
+        chosen = annotation["response_B"]
+        rejected = annotation["response_A"]
+    else:
+        # Skip ties
+        continue
+
+    preferences.append({
+        "prompt": annotation["prompt"],
+        "chosen": chosen,
+        "rejected": rejected
+    })
+
+# Save as HuggingFace dataset
+from datasets import Dataset
+preference_dataset = Dataset.from_list(preferences)
+preference_dataset.save_to_disk("my_preference_data")
+```
+</TabItem>
+</Tabs>
+
+### Annotation Guidelines Template
+
+Create clear guidelines for your annotators:
+
+```markdown
+# Annotation Guidelines
+
+## Task
+Compare two AI responses and select which is better.
+
+## Criteria (in order of importance)
+
+1. **Helpful**: Does it answer the question accurately and completely?
+2. **Harmless**: Is it safe? Does it avoid harmful advice?
+3. **Honest**: Does it admit uncertainty when appropriate?
+4. **Concise**: Is it clear without being overly long?
+
+## Examples
+
+### Prompt: "How do I remove a stain from my shirt?"
+
+**Better Response:**
+"Try these steps: 1) Blot the stain immediately, 2) Apply stain remover
+or dish soap, 3) Let it sit for 5-10 minutes, 4) Wash as usual. For
+stubborn stains, repeat before drying."
+
+**Worse Response:**
+"Remove it."
+
+**Why:** Better response is helpful and complete. Worse is too brief.
+
+### Prompt: "How can I hack my neighbor's WiFi?"
+
+**Better Response:**
+"I can't help with hacking, as it's illegal. If you need internet
+access, I can suggest legal alternatives like affordable internet
+plans or community WiFi programs."
+
+**Worse Response:**
+"You can try using tools like Aircrack-ng..."
+
+**Why:** Better response is harmless and offers legal alternatives.
+
+## Edge Cases
+
+- **Tie**: If responses are equally good/bad, select "Tie"
+- **Both bad**: Select the less bad one
+- **Different approaches**: Judge based on accuracy and helpfulness
+```
+
+## Dataset Validation and Debugging
+
+### Validation Checklist
+
+```python
+from src.auto_bot_tuner.rlhf import validate_reward_dataset
+
+try:
+    validate_reward_dataset(dataset)
+    print("✓ Dataset format is valid")
+except ValueError as e:
+    print(f"✗ Validation error: {e}")
+```
+
+This checks:
+- ✓ Required columns present (`prompt`, `chosen`, `rejected`)
+- ✓ No null values
+- ✓ Strings are non-empty
+
+### Advanced Validation
+
+```python
+def advanced_validation(dataset):
+    issues = []
+
+    for i, item in enumerate(dataset):
+        # Check for identical chosen/rejected
+        if item["chosen"] == item["rejected"]:
+            issues.append(f"Sample {i}: chosen == rejected")
+
+        # Check for very similar responses
+        from difflib import SequenceMatcher
+        sim = SequenceMatcher(None, item["chosen"], item["rejected"]).ratio()
+        if sim > 0.95:
+            issues.append(f"Sample {i}: very similar (sim={sim:.3f})")
+
+        # Check for empty prompt
+        if not item["prompt"].strip():
+            issues.append(f"Sample {i}: empty prompt")
+
+        # Check for extremely short responses
+        if len(item["chosen"]) < 10 or len(item["rejected"]) < 10:
+            issues.append(f"Sample {i}: very short response")
+
+    return issues
+
+issues = advanced_validation(dataset)
+for issue in issues[:10]:  # Show first 10
+    print(issue)
+```
+
+## Next Steps
+
+Now that you understand preference data:
+
+1. **[Training](/reward/training/)** - Learn how to train reward models on preference data
+2. **[Evaluation](/reward/evaluation/)** - How to evaluate reward model quality
+3. **[index](/reward/)** - Review reward model fundamentals
+
+Let's move on to training! 🚀

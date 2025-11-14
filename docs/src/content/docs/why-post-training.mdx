@@ -1,0 +1,225 @@
+---
+title: Why Post-Training Matters
+description: Understanding the critical role of post-training in modern AI systems
+---
+
+## The Fundamental Problem
+
+Pre-trained language models are trained on massive text corpora using a simple objective: **predict the next token**. While this teaches models remarkable linguistic and world knowledge, it creates a fundamental misalignment:
+
+**The model learns to continue text, not to be helpful.**
+
+### Example: The Difference is Striking
+
+Let's see the same model before and after post-training:
+
+**Base Model (Pre-training only):**
+```
+User: What's the capital of France?
+
+Model: is it Paris or Lyon? Some people think it might be Marseille
+but I believe the answer is Paris, although I could be wrong. The
+capital has historically been...
+```
+
+The model continues the pattern of uncertain discussion because that's common in its training data.
+
+**Post-Trained Model:**
+```
+User: What's the capital of France?
+
+Model: The capital of France is Paris.
+```
+
+The model learned to provide direct, helpful answers.
+
+## What Post-Training Achieves
+
+Post-training transforms models through several key capabilities:
+
+### 1. Instruction Following
+
+**Before:** The model treats your input as text to continue
+**After:** The model understands you're giving it instructions
+
+Pre-training doesn't teach models that text starting with "Write a poem about" is a *request* rather than the beginning of an essay about poetry.
+
+### 2. Preference Alignment
+
+**Before:** The model samples from its learned distribution
+**After:** The model generates responses humans prefer
+
+A base model might be equally likely to generate helpful explanations or controversial rants. Post-training teaches it to prefer helpful, harmless responses.
+
+### 3. Conversational Behavior
+
+**Before:** The model has no concept of "assistant" vs "user"
+**After:** The model maintains appropriate assistant behavior
+
+Post-training teaches the model to:
+- Ask clarifying questions when uncertain
+- Decline inappropriate requests
+- Maintain consistency across a conversation
+- Acknowledge its limitations
+
+### 4. Task Specialization
+
+**Before:** General text completion
+**After:** Specialized for specific tasks
+
+You can post-train models to excel at:
+- Customer service conversations
+- Code generation and debugging
+- Medical question answering
+- Creative writing assistance
+- Teaching and tutoring
+
+## Real-World Impact
+
+Every major AI assistant uses post-training:
+
+| System | Post-Training Approach |
+|--------|----------------------|
+| **ChatGPT** | SFT → RLHF with PPO |
+| **Claude** | Constitutional AI (SFT → RLHF) |
+| **Gemini** | SFT → RLHF |
+| **Llama Chat Models** | SFT → DPO/RLHF |
+
+Without post-training, these would just be autocomplete engines, not assistants.
+
+## The Core Challenge
+
+Post-training solves a **distribution mismatch**:
+
+```
+Pre-training Distribution: P(text from internet)
+Desired Distribution: P(helpful responses|instructions)
+```
+
+The model was trained to match internet text statistics. We need it to match human preferences for helpful dialog.
+
+### Why Simple Fine-Tuning Isn't Enough
+
+You might think: "Just fine-tune on good conversations!" But this has problems:
+
+1. **Supervision is expensive** - Writing thousands of high-quality responses is costly
+2. **Preferences are subtle** - Humans know what they prefer but can't always articulate why
+3. **Distribution shift** - The model needs to generalize beyond training examples
+4. **Safety concerns** - We need models that refuse harmful requests, not just follow instructions
+
+This is why we need sophisticated post-training techniques.
+
+## The Post-Training Toolkit
+
+Modern post-training uses a progression of techniques:
+
+### Step 1: Supervised Fine-Tuning (SFT)
+
+**What:** Train on (instruction, response) pairs
+**Goal:** Teach basic instruction-following
+**Data:** ~10K-100K examples of high-quality responses
+
+This is the foundation. The model learns the basic pattern of "instruction → appropriate response."
+
+### Step 2: Preference Learning
+
+After SFT, we have a model that follows instructions. Now we make it better through preferences:
+
+**Two approaches:**
+
+#### RLHF (Reinforcement Learning from Human Feedback)
+1. Train a **reward model** on preference comparisons
+2. Use **PPO** to optimize the language model for high rewards
+3. Add **KL penalty** to prevent distribution shift
+
+**Pros:** Powerful, used by GPT-4 and Claude
+**Cons:** Complex, can be unstable, requires multiple models
+
+#### DPO (Direct Preference Optimization)
+1. Skip the reward model
+2. **Directly optimize** on preference pairs
+3. Simpler objective with implicit rewards
+
+**Pros:** Simpler, more stable, easier to implement
+**Cons:** Less flexible than full RLHF pipeline
+
+## Why This Matters for You
+
+Understanding post-training is crucial if you:
+
+### Build AI Applications
+- Know when to use base vs chat models
+- Understand model limitations
+- Fine-tune models for your use case
+- Debug unexpected model behavior
+
+### Research AI Alignment
+- Understand how models learn values
+- Identify failure modes
+- Develop better training techniques
+- Contribute to AI safety
+
+### Deploy AI Systems
+- Choose appropriate models
+- Set correct hyperparameters
+- Monitor model behavior
+- Handle edge cases
+
+## The Mathematics of Preference
+
+At its core, post-training is about optimization:
+
+**Pre-training objective:**
+```
+maximize E[log P(next_token | context)]
+```
+
+**Post-training objective (simplified):**
+```
+maximize E[reward(response | instruction)]
+subject to: KL(policy || base_model) < threshold
+```
+
+We're optimizing for human-rated quality while staying close to the original model.
+
+The **KL constraint** is critical - it prevents the model from:
+- Generating nonsense that "hacks" the reward
+- Losing its linguistic capabilities
+- Becoming too narrow/specialized
+
+## Common Misconceptions
+
+### "Post-training is just supervised learning"
+**False.** While SFT uses supervised learning, preference learning (DPO/RLHF) optimizes for pairwise preferences, not individual examples.
+
+### "More training data always helps"
+**Not necessarily.** Quality matters more than quantity. 10K high-quality examples often beats 100K mediocre ones.
+
+### "Post-training fixes all model problems"
+**No.** Post-training can't add knowledge the model doesn't have. It shapes behavior, but the model's capabilities come from pre-training.
+
+### "You need millions of examples"
+**False.** Effective post-training can happen with 10K-100K examples, much less than pre-training.
+
+## Historical Context
+
+Post-training emerged from several research threads:
+
+- **2017:** RLHF first applied to summarization (Ziegler et al.)
+- **2020:** Fine-tuning with human feedback (Stiennon et al.)
+- **2022:** InstructGPT shows power of RLHF at scale (OpenAI)
+- **2023:** DPO provides simpler alternative (Rafailov et al.)
+- **2024:** Constitutional AI, RLAIF, and other variants
+
+The field is rapidly evolving with new techniques emerging constantly.
+
+## Next Steps
+
+Ready to dive deeper? Here's your learning path:
+
+1. **[Project Overview](/overview/)** - Understand what we'll build
+2. **[Supervised Fine-Tuning](/sft/)** - Start with the foundation
+3. **[Reward Modeling](/reward/)** - Learn to predict preferences
+4. **[RLHF](/rlhf/)** and **[DPO](/dpo/)** - Master preference optimization
+
+Let's build AI systems that are helpful, harmless, and honest! 🚀

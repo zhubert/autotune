@@ -1,0 +1,25 @@
+# Quick SFT Training Configuration
+# For fast testing and prototyping
+
+model:
+  name: "gpt2"
+  use_lora: true
+
+dataset:
+  name: "yahma/alpaca-cleaned"
+  max_samples: 500
+  max_length: 256
+  format_type: "alpaca"
+
+training:
+  learning_rate: 2e-5
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  num_epochs: 1
+  warmup_steps: 50
+  max_grad_norm: 1.0
+  logging_steps: 10
+  save_steps: 500
+  bf16: true
+  fp16: false
+  output_dir: "checkpoints/sft/quick"

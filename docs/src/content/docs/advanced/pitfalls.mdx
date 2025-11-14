@@ -1,0 +1,1068 @@
+---
+title: Common Pitfalls
+description: Learn from common mistakes and how to avoid them
+---
+
+import { Aside, Card, CardGrid, Tabs, TabItem } from '@astrojs/starlight/components';
+
+## Introduction
+
+**Even experienced practitioners make these mistakes.** This guide helps you avoid common pitfalls and debug issues quickly.
+
+Each pitfall includes:
+- **Symptom:** How to recognize the problem
+- **Cause:** Why it happens
+- **Solution:** How to fix it
+- **Prevention:** How to avoid it
+
+## Training Divergence and Instability
+
+### Pitfall 1: Loss Becomes NaN
+
+**Symptom:**
+
+```
+Epoch 1, Step 10:  Loss = 2.34
+Epoch 1, Step 20:  Loss = 1.98
+Epoch 1, Step 30:  Loss = 5.67
+Epoch 1, Step 40:  Loss = inf
+Epoch 1, Step 50:  Loss = nan  ← Training dead!
+```
+
+**Causes:**
+
+1. **Learning rate too high** (most common)
+2. **Gradient explosion** (large gradient spikes)
+3. **Numerical instability** (FP16 underflow/overflow)
+4. **Bad batch** (malformed data or extreme outliers)
+
+**Solutions:**
+
+```python
+# 1. Reduce learning rate by 10x
+config = SFTConfig(
+    learning_rate=3e-5,  # Was 3e-4
+)
+
+# 2. Enable/strengthen gradient clipping
+config = SFTConfig(
+    max_grad_norm=0.5,  # Was 1.0 or None
+)
+
+# 3. Use BF16 instead of FP16
+model = AutoModelForCausalLM.from_pretrained(
+    model_path,
+    torch_dtype=torch.bfloat16,  # More stable than float16
+)
+
+# 4. Add gradient nan check
+for batch in dataloader:
+    loss = compute_loss(...)
+    loss.backward()
+
+    # Check for nan gradients
+    has_nan = False
+    for param in model.parameters():
+        if param.grad is not None and torch.isnan(param.grad).any():
+            has_nan = True
+            break
+
+    if has_nan:
+        print("NaN gradient detected! Skipping batch.")
+        optimizer.zero_grad()
+        continue  # Skip this batch
+
+    optimizer.step()
+    optimizer.zero_grad()
+```
+
+**Prevention:**
+
+```python
+# Start with conservative settings
+config = SFTConfig(
+    learning_rate=1e-4,      # Conservative
+    max_grad_norm=0.5,       # Aggressive clipping
+    warmup_steps=100,        # Gradual warmup
+)
+
+# Monitor gradient norms
+for name, param in model.named_parameters():
+    if param.grad is not None:
+        grad_norm = param.grad.norm().item()
+        if grad_norm > 10.0:
+            print(f"Warning: Large gradient in {name}: {grad_norm:.2f}")
+```
+
+<Aside type="caution">
+If loss becomes NaN, you must restart training from the last good checkpoint. The optimizer state is corrupted.
+</Aside>
+
+### Pitfall 2: Loss Not Decreasing
+
+**Symptom:**
+
+```
+Epoch 1, Step 100:  Loss = 2.45
+Epoch 1, Step 200:  Loss = 2.44
+Epoch 1, Step 300:  Loss = 2.43
+Epoch 1, Step 400:  Loss = 2.42  ← Barely moving!
+```
+
+**Causes:**
+
+1. **Learning rate too low**
+2. **Model frozen** (forgot to set trainable parameters)
+3. **Wrong optimizer state** (loaded checkpoint incorrectly)
+4. **Insufficient model capacity** (LoRA rank too small)
+
+**Solutions:**
+
+```python
+# 1. Check trainable parameters
+trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+total = sum(p.numel() for p in model.parameters())
+
+print(f"Trainable: {trainable:,} ({100*trainable/total:.2f}%)")
+
+if trainable == 0:
+    print("ERROR: No trainable parameters!")
+    # Make sure LoRA is applied or model is not frozen
+
+# 2. Increase learning rate
+config = SFTConfig(
+    learning_rate=3e-4,  # Was 3e-5
+)
+
+# 3. Increase LoRA rank
+lora_config = LoraConfig(
+    r=32,  # Was 8
+    lora_alpha=64,
+)
+
+# 4. Check optimizer
+print(f"Optimizer learning rate: {optimizer.param_groups[0]['lr']}")
+```
+
+**Prevention:**
+
+```python
+# Verify setup before training
+def verify_training_setup(model, optimizer):
+    """Verify model and optimizer are configured correctly."""
+
+    # Check trainable params
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    if trainable == 0:
+        raise ValueError("No trainable parameters! Check model setup.")
+
+    # Check optimizer has parameters
+    if len(optimizer.param_groups) == 0:
+        raise ValueError("Optimizer has no parameter groups!")
+
+    # Check learning rate
+    lr = optimizer.param_groups[0]['lr']
+    if lr < 1e-6 or lr > 1e-2:
+        print(f"Warning: Unusual learning rate: {lr}")
+
+    print(f"✓ Trainable params: {trainable:,}")
+    print(f"✓ Learning rate: {lr}")
+
+verify_training_setup(model, optimizer)
+```
+
+## Overfitting
+
+### Pitfall 3: Training Loss ≪ Validation Loss
+
+**Symptom:**
+
+```
+Epoch 1: Train loss = 1.8, Val loss = 2.0  (gap = 0.2) ✓
+Epoch 2: Train loss = 1.2, Val loss = 2.1  (gap = 0.9)
+Epoch 3: Train loss = 0.8, Val loss = 2.4  (gap = 1.6) ← Overfitting!
+```
+
+**Causes:**
+
+1. **Small dataset** (&lt;10k examples)
+2. **Training too many epochs**
+3. **Insufficient regularization**
+4. **Model too large for dataset**
+
+**Solutions:**
+
+```python
+# 1. Add/increase regularization
+config = SFTConfig(
+    weight_decay=0.1,        # Was 0.01
+    lora_dropout=0.1,        # Was 0.05
+)
+
+# 2. Early stopping
+from transformers import EarlyStoppingCallback
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
+)
+
+# 3. Reduce model capacity
+lora_config = LoraConfig(
+    r=8,  # Was 16
+    lora_alpha=16,
+)
+
+# 4. Data augmentation
+def augment_data(example):
+    """Augment training data with paraphrases."""
+    # Add paraphrases, back-translation, etc.
+    return example
+
+train_dataset = train_dataset.map(augment_data)
+
+# 5. Reduce epochs
+config = SFTConfig(
+    num_epochs=2,  # Was 5
+)
+```
+
+**Prevention:**
+
+```python
+# Monitor train/val gap during training
+def check_overfitting(train_loss, val_loss, threshold=0.5):
+    """Check if model is overfitting."""
+    gap = val_loss - train_loss
+
+    if gap > threshold:
+        print(f"Warning: Train/val gap = {gap:.2f} (overfitting!)")
+        return True
+    return False
+
+# During training loop
+if check_overfitting(metrics['train_loss'], metrics['eval_loss']):
+    print("Stopping early due to overfitting")
+    break
+```
+
+### Pitfall 4: Model Memorizing Training Data
+
+**Symptom:**
+
+Model generates exact training examples verbatim:
+
+```python
+prompt = "Tell me about machine learning"
+response = model.generate(prompt)
+# Output: Exact copy of training example, including formatting quirks
+```
+
+**Causes:**
+
+1. **Duplicate training examples**
+2. **Very small dataset with many epochs**
+3. **No dropout or regularization**
+
+**Solutions:**
+
+```python
+# 1. Remove duplicates
+from datasets import Dataset
+
+def remove_duplicates(dataset):
+    """Remove duplicate examples from dataset."""
+    seen = set()
+    unique_examples = []
+
+    for example in dataset:
+        # Create hash of the content
+        content_hash = hash(example['text'])
+
+        if content_hash not in seen:
+            seen.add(content_hash)
+            unique_examples.append(example)
+
+    print(f"Removed {len(dataset) - len(unique_examples)} duplicates")
+    return Dataset.from_list(unique_examples)
+
+train_dataset = remove_duplicates(train_dataset)
+
+# 2. Add dropout
+lora_config = LoraConfig(
+    r=16,
+    lora_dropout=0.1,  # Add dropout to LoRA layers
+)
+
+# 3. Reduce epochs
+config = SFTConfig(
+    num_epochs=1,  # Only one pass through data
+)
+```
+
+## Forgetting and Distribution Shift
+
+### Pitfall 5: Catastrophic Forgetting
+
+**Symptom:**
+
+After fine-tuning, model **loses general capabilities**:
+
+```python
+# Before fine-tuning (base model)
+prompt = "What is the capital of France?"
+response = "The capital of France is Paris."  ✓
+
+# After fine-tuning on medical data
+prompt = "What is the capital of France?"
+response = "The capital of France is diabetes mellitus."  ✗ (What?!)
+```
+
+**Causes:**
+
+1. **Learning rate too high**
+2. **Training too long**
+3. **Dataset too narrow** (single domain)
+4. **No KL penalty** (for DPO/RLHF)
+
+**Solutions:**
+
+```python
+# 1. Lower learning rate (especially for full fine-tuning)
+config = SFTConfig(
+    learning_rate=1e-5,  # Was 3e-4
+)
+
+# 2. Use LoRA instead of full fine-tuning
+model, tokenizer, device = load_model_and_tokenizer(
+    model_path,
+    use_lora=True,  # LoRA has less forgetting
+)
+
+# 3. Mix general data with specialized data
+from datasets import concatenate_datasets
+
+general_data = load_dataset("allenai/c4", split="train[:10000]")
+specialized_data = load_dataset("medical_qa", split="train")
+
+# Mix 10% general, 90% specialized
+mixed_dataset = concatenate_datasets([
+    general_data,
+    specialized_data,
+])
+
+# 4. For DPO: Ensure KL penalty
+config = DPOConfig(
+    beta=0.1,  # KL penalty prevents forgetting
+)
+
+# 5. Test on held-out general knowledge
+general_test = load_dataset("wikitext", split="test")
+perplexity = compute_perplexity_on_dataset(model, general_test, tokenizer)
+
+if perplexity > 100:  # Base model was ~30
+    print("Warning: Model may have forgotten general knowledge!")
+```
+
+**Prevention:**
+
+```python
+# Evaluate on general benchmarks before and after
+def evaluate_general_knowledge(model, tokenizer):
+    """Evaluate on general knowledge to detect forgetting."""
+
+    test_cases = [
+        "What is 2 + 2?",
+        "Who wrote Romeo and Juliet?",
+        "What is the capital of France?",
+        "What is water made of?",
+        # Add more basic questions
+    ]
+
+    correct = 0
+    for question in test_cases:
+        response = generate_response(model, tokenizer, question)
+
+        # Check if answer is reasonable (manual or with GPT-4)
+        if is_correct(question, response):
+            correct += 1
+
+    accuracy = correct / len(test_cases)
+
+    if accuracy < 0.7:
+        print(f"Warning: General knowledge accuracy: {accuracy:.1%}")
+
+    return accuracy
+
+# Before training
+before_acc = evaluate_general_knowledge(base_model, tokenizer)
+
+# After training
+after_acc = evaluate_general_knowledge(finetuned_model, tokenizer)
+
+print(f"General knowledge: {before_acc:.1%} → {after_acc:.1%}")
+
+if after_acc < before_acc - 0.2:
+    print("Warning: Significant forgetting detected!")
+```
+
+### Pitfall 6: Reference Model Divergence (DPO/RLHF)
+
+**Symptom:**
+
+In DPO or RLHF, KL divergence from reference model explodes:
+
+```
+Step 10:  KL = 0.05  ✓
+Step 20:  KL = 0.08  ✓
+Step 30:  KL = 0.15
+Step 40:  KL = 0.35
+Step 50:  KL = 1.20  ← Too high!
+```
+
+**Causes:**
+
+1. **Learning rate too high**
+2. **Beta/KL coefficient too low** (weak constraint)
+3. **Reference model not frozen**
+4. **Training too long**
+
+**Solutions:**
+
+```python
+# 1. Verify reference model is frozen
+from src.auto_bot_tuner.dpo import create_reference_model
+
+ref_model = create_reference_model(policy_model, device)
+
+# Check it's frozen
+for param in ref_model.parameters():
+    assert not param.requires_grad, "Reference model must be frozen!"
+
+# 2. Increase beta (DPO) or KL coefficient (RLHF)
+# DPO:
+dpo_config = DPOConfig(
+    beta=0.3,  # Was 0.1, stronger KL penalty
+)
+
+# RLHF:
+rlhf_config = RLHFConfig(
+    kl_coef=0.3,  # Was 0.1, stronger KL penalty
+)
+
+# 3. Lower learning rate
+config = DPOConfig(
+    learning_rate=1e-5,  # Was 5e-5
+    beta=0.1,
+)
+
+# 4. Monitor KL divergence
+def compute_kl_divergence(policy_model, ref_model, batch):
+    """Compute KL(policy || reference)."""
+    with torch.no_grad():
+        policy_logits = policy_model(**batch).logits
+        ref_logits = ref_model(**batch).logits
+
+        policy_probs = F.softmax(policy_logits, dim=-1)
+        ref_log_probs = F.log_softmax(ref_logits, dim=-1)
+
+        kl = (policy_probs * (policy_probs.log() - ref_log_probs)).sum(-1).mean()
+
+    return kl.item()
+
+# During training
+kl = compute_kl_divergence(policy_model, ref_model, batch)
+if kl > 0.5:
+    print(f"Warning: KL divergence too high: {kl:.2f}")
+```
+
+**Prevention:**
+
+```python
+# Use adaptive KL coefficient
+class AdaptiveKLController:
+    def __init__(self, init_kl_coef=0.1, target_kl=0.1):
+        self.kl_coef = init_kl_coef
+        self.target_kl = target_kl
+
+    def update(self, current_kl):
+        """Adjust KL coefficient based on current KL."""
+        if current_kl > 2 * self.target_kl:
+            # KL too high, increase coefficient
+            self.kl_coef *= 1.5
+            print(f"Increasing KL coef to {self.kl_coef:.3f}")
+        elif current_kl < 0.5 * self.target_kl:
+            # KL too low, decrease coefficient
+            self.kl_coef *= 0.8
+            print(f"Decreasing KL coef to {self.kl_coef:.3f}")
+
+        return self.kl_coef
+
+# Use in training
+kl_controller = AdaptiveKLController()
+
+for step, batch in enumerate(dataloader):
+    # Training step...
+    kl = compute_kl_divergence(policy, reference, batch)
+
+    # Adjust coefficient
+    new_kl_coef = kl_controller.update(kl)
+```
+
+## Data Quality Issues
+
+### Pitfall 7: Wrong Loss Masking
+
+**Symptom:**
+
+Model doesn't learn, or learns to generate prompts instead of responses:
+
+```python
+prompt = "Summarize this article: [long text]"
+response = "Summarize this article: [repeats prompt]"  ← Wrong!
+```
+
+**Cause:**
+
+Not masking prompt tokens in loss computation.
+
+**Solution:**
+
+From `/home/user/autotune/src/auto_bot_tuner/sft/dataset.py`:
+
+```python
+# Correct implementation
+def format_instruction(example, tokenizer):
+    """Format instruction with proper loss masking."""
+
+    # Construct prompt
+    prompt = f"Instruction: {example['instruction']}\nInput: {example['input']}\nOutput: "
+
+    # Tokenize prompt and response separately
+    prompt_ids = tokenizer.encode(prompt, add_special_tokens=True)
+    response_ids = tokenizer.encode(example['output'], add_special_tokens=False)
+
+    # Combine
+    input_ids = prompt_ids + response_ids + [tokenizer.eos_token_id]
+
+    # Create labels: -100 for prompt (ignored), actual IDs for response
+    labels = [-100] * len(prompt_ids) + response_ids + [tokenizer.eos_token_id]
+
+    assert len(input_ids) == len(labels), "Mismatch in input_ids and labels!"
+
+    return {
+        'input_ids': input_ids,
+        'labels': labels,
+    }
+
+# Verify masking
+example = dataset[0]
+prompt_length = (np.array(example['labels']) == -100).sum()
+response_length = (np.array(example['labels']) != -100).sum()
+
+print(f"Prompt tokens (masked): {prompt_length}")
+print(f"Response tokens (not masked): {response_length}")
+
+if response_length == 0:
+    print("ERROR: All tokens are masked! No training signal.")
+```
+
+**Prevention:**
+
+```python
+# Test loss masking
+def test_loss_masking(dataset):
+    """Verify loss masking is correct."""
+
+    for i in range(min(10, len(dataset))):
+        example = dataset[i]
+
+        input_ids = example['input_ids']
+        labels = example['labels']
+
+        # Count masked tokens
+        masked = sum(1 for l in labels if l == -100)
+        unmasked = sum(1 for l in labels if l != -100)
+
+        print(f"Example {i}: {masked} masked, {unmasked} unmasked")
+
+        if unmasked == 0:
+            print(f"ERROR in example {i}: All tokens masked!")
+        if masked == 0:
+            print(f"WARNING in example {i}: No tokens masked (prompt included in loss?)")
+
+test_loss_masking(train_dataset)
+```
+
+### Pitfall 8: Poor Data Quality
+
+**Symptom:**
+
+Model learns, but generates low-quality, incoherent, or unsafe responses.
+
+**Causes:**
+
+1. **Dataset has errors, typos, poor grammar**
+2. **Dataset contains toxic or biased content**
+3. **Instructions are unclear or inconsistent**
+4. **Responses are low quality**
+
+**Solutions:**
+
+```python
+# 1. Filter low-quality examples
+def filter_quality(dataset):
+    """Remove low-quality examples."""
+
+    def is_high_quality(example):
+        response = example['output']
+
+        # Too short
+        if len(response.split()) < 10:
+            return False
+
+        # Too long
+        if len(response.split()) > 500:
+            return False
+
+        # Check for common issues
+        if response.isupper():  # All caps
+            return False
+
+        if len(set(response.split())) < len(response.split()) * 0.3:  # Too repetitive
+            return False
+
+        return True
+
+    filtered = dataset.filter(is_high_quality)
+    print(f"Kept {len(filtered)} / {len(dataset)} examples")
+
+    return filtered
+
+train_dataset = filter_quality(train_dataset)
+
+# 2. Check for toxicity
+from transformers import pipeline
+
+toxicity_classifier = pipeline("text-classification", model="unitary/toxic-bert")
+
+def filter_toxic(dataset):
+    """Remove toxic examples."""
+
+    def is_safe(example):
+        result = toxicity_classifier(example['output'])[0]
+        return result['label'] != 'toxic' or result['score'] < 0.5
+
+    safe_dataset = dataset.filter(is_safe)
+    print(f"Removed {len(dataset) - len(safe_dataset)} toxic examples")
+
+    return safe_dataset
+
+train_dataset = filter_toxic(train_dataset)
+
+# 3. Deduplicate
+from datasets import Dataset
+
+def deduplicate(dataset, key='output'):
+    """Remove duplicate responses."""
+    seen = set()
+    unique = []
+
+    for example in dataset:
+        content = example[key]
+        if content not in seen:
+            seen.add(content)
+            unique.append(example)
+
+    print(f"Removed {len(dataset) - len(unique)} duplicates")
+    return Dataset.from_list(unique)
+
+train_dataset = deduplicate(train_dataset)
+```
+
+## RLHF-Specific Pitfalls
+
+### Pitfall 9: Reward Hacking
+
+**Symptom:**
+
+Model achieves high reward but generates nonsensical or exploitative responses:
+
+```python
+# Reward model trained on length preference
+# Model learns: longer = better
+
+prompt = "Say hello"
+response = "Hello hello hello hello hello..."  # Repeats to maximize length
+reward = 10.0  # High reward, but terrible response!
+```
+
+**Causes:**
+
+1. **Reward model is imperfect** (proxy for true objective)
+2. **Reward model overoptimized** (policy exploits weaknesses)
+3. **Insufficient KL penalty**
+
+**Solutions:**
+
+```python
+# 1. Increase KL penalty
+rlhf_config = RLHFConfig(
+    kl_coef=0.5,  # Was 0.1, much stronger
+)
+
+# 2. Add rule-based constraints
+def apply_constraints(response, reward):
+    """Apply rule-based penalties to reward."""
+
+    # Penalize repetition
+    words = response.split()
+    unique_ratio = len(set(words)) / len(words)
+    if unique_ratio < 0.5:
+        reward -= 5.0  # Heavy penalty for repetition
+
+    # Penalize extreme length
+    if len(words) > 300:
+        reward -= 2.0
+
+    if len(words) < 5:
+        reward -= 3.0
+
+    return reward
+
+# 3. Ensemble reward models
+def ensemble_reward(response, reward_models):
+    """Average rewards from multiple models."""
+    rewards = [rm(response) for rm in reward_models]
+    return np.mean(rewards)
+
+# 4. Monitor reward distribution
+def check_reward_hacking(rewards):
+    """Detect if policy is exploiting reward model."""
+    if np.std(rewards) < 0.1:
+        print("Warning: All rewards similar (may be hacking)")
+
+    if np.max(rewards) > 10 * np.mean(rewards):
+        print("Warning: Outlier rewards detected")
+
+    # Check for repetition in high-reward responses
+    high_reward_responses = [r for r, reward in zip(responses, rewards) if reward > np.percentile(rewards, 90)]
+
+    for response in high_reward_responses:
+        words = response.split()
+        if len(set(words)) < len(words) * 0.5:
+            print(f"Warning: High-reward response is repetitive: {response[:100]}")
+```
+
+**Prevention:**
+
+```python
+# Train reward model with diversity
+def train_reward_with_diversity(reward_model, preference_data):
+    """Train reward model with diversity bonus."""
+
+    for batch in dataloader:
+        # Standard preference loss
+        loss = compute_preference_loss(reward_model, batch)
+
+        # Add diversity regularization
+        # Penalize reward model for rewarding repetitive text
+        diversity_loss = compute_diversity_penalty(reward_model, batch)
+
+        total_loss = loss + 0.1 * diversity_loss
+        total_loss.backward()
+        optimizer.step()
+
+# Use held-out test for reward model
+reward_train, reward_test = train_test_split(preference_data, test_size=0.2)
+
+# Train only on train, evaluate on test
+# Don't overtrain (causes overfitting → easy to exploit)
+```
+
+### Pitfall 10: Value Network Not Learning
+
+**Symptom:**
+
+In RLHF/PPO, value network predictions are inaccurate:
+
+```
+True return:  5.2    Value prediction:  0.3  (error = 4.9)
+True return:  -1.5   Value prediction:  0.2  (error = 1.7)
+True return:  8.1    Value prediction:  0.4  (error = 7.7)
+```
+
+**Causes:**
+
+1. **Value learning rate too low**
+2. **Value network too small**
+3. **Advantage normalization issues**
+
+**Solutions:**
+
+```python
+# 1. Increase value learning rate
+rlhf_config = RLHFConfig(
+    policy_lr=1e-5,
+    value_lr=1e-4,  # 10x higher than policy
+)
+
+# 2. Train value network more
+rlhf_config = RLHFConfig(
+    ppo_epochs=4,        # Policy updates
+    value_epochs=8,      # Value network updates (2x more)
+)
+
+# 3. Check value network architecture
+from src.auto_bot_tuner.rlhf import create_value_network_from_policy
+
+value_net = create_value_network_from_policy(policy_model)
+
+# Verify it's separate from policy
+print(f"Value net params: {sum(p.numel() for p in value_net.parameters()):,}")
+
+# 4. Monitor value loss
+print(f"Value loss: {value_loss:.4f}")
+print(f"Explained variance: {explained_variance:.2%}")
+
+if explained_variance < 0.3:
+    print("Warning: Value network not learning well")
+```
+
+## Debugging Strategies
+
+### Strategy 1: Minimal Reproducible Example
+
+**Isolate the problem:**
+
+```python
+# Create minimal test case
+def test_minimal():
+    """Test training on tiny dataset."""
+
+    # Tiny dataset (10 examples)
+    tiny_dataset = train_dataset.select(range(10))
+
+    # Minimal config
+    config = SFTConfig(
+        learning_rate=3e-4,
+        batch_size=2,
+        num_epochs=1,
+        max_steps=5,  # Only 5 steps
+    )
+
+    # Train
+    trainer = SFTTrainer(
+        model=model,
+        config=config,
+        train_dataset=tiny_dataset,
+    )
+
+    # Should complete quickly
+    trainer.train()
+
+    print("✓ Minimal example works")
+
+# If this fails, problem is in setup, not data/hyperparameters
+test_minimal()
+```
+
+### Strategy 2: Gradient Checks
+
+**Verify gradients are flowing correctly:**
+
+```python
+def check_gradients(model, batch):
+    """Check if gradients are computed correctly."""
+
+    model.train()
+    optimizer.zero_grad()
+
+    # Forward pass
+    outputs = model(**batch)
+    loss = outputs.loss
+
+    # Backward pass
+    loss.backward()
+
+    # Check gradients
+    grad_norms = {}
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            if param.grad is not None:
+                grad_norm = param.grad.norm().item()
+                grad_norms[name] = grad_norm
+
+                if grad_norm == 0:
+                    print(f"Warning: Zero gradient in {name}")
+                elif torch.isnan(param.grad).any():
+                    print(f"Error: NaN gradient in {name}")
+                elif grad_norm > 100:
+                    print(f"Warning: Large gradient in {name}: {grad_norm:.2f}")
+            else:
+                print(f"Warning: No gradient for {name}")
+
+    # Print summary
+    if grad_norms:
+        avg_grad = np.mean(list(grad_norms.values()))
+        max_grad = max(grad_norms.values())
+        print(f"Average gradient norm: {avg_grad:.4f}")
+        print(f"Max gradient norm: {max_grad:.4f}")
+
+# Run check
+check_gradients(model, next(iter(train_dataloader)))
+```
+
+### Strategy 3: Comparison with Known Good
+
+**Compare with baseline:**
+
+```python
+# Train baseline with known-good hyperparameters
+baseline_config = SFTConfig(
+    learning_rate=3e-4,
+    batch_size=8,
+    num_epochs=1,
+    # All default, known to work
+)
+
+baseline_metrics = train_and_evaluate(model, baseline_config, small_dataset)
+
+# Train with your config
+your_metrics = train_and_evaluate(model, your_config, small_dataset)
+
+# Compare
+print(f"Baseline loss: {baseline_metrics['loss']:.4f}")
+print(f"Your loss:     {your_metrics['loss']:.4f}")
+
+if your_metrics['loss'] > baseline_metrics['loss'] * 1.5:
+    print("Warning: Your config is significantly worse than baseline")
+```
+
+### Strategy 4: Bisection Debugging
+
+**Find the source of the problem by binary search:**
+
+```python
+def bisect_debug():
+    """Find which component is causing issues."""
+
+    # Test 1: Model loads correctly?
+    try:
+        model = load_model("gpt2")
+        print("✓ Model loads")
+    except Exception as e:
+        print(f"✗ Model loading failed: {e}")
+        return
+
+    # Test 2: Dataset processes correctly?
+    try:
+        dataset = load_and_process_dataset()
+        print("✓ Dataset loads")
+    except Exception as e:
+        print(f"✗ Dataset failed: {e}")
+        return
+
+    # Test 3: Can do one forward pass?
+    try:
+        batch = next(iter(dataloader))
+        outputs = model(**batch)
+        print("✓ Forward pass works")
+    except Exception as e:
+        print(f"✗ Forward pass failed: {e}")
+        return
+
+    # Test 4: Can do backward pass?
+    try:
+        loss = outputs.loss
+        loss.backward()
+        print("✓ Backward pass works")
+    except Exception as e:
+        print(f"✗ Backward pass failed: {e}")
+        return
+
+    # Test 5: Can do optimizer step?
+    try:
+        optimizer.step()
+        print("✓ Optimizer step works")
+    except Exception as e:
+        print(f"✗ Optimizer step failed: {e}")
+        return
+
+    print("✓ All components work individually")
+
+bisect_debug()
+```
+
+## Quick Reference: Debugging Checklist
+
+When something goes wrong, check in this order:
+
+**1. Environment Setup**
+- [ ] PyTorch installed correctly
+- [ ] GPU accessible (`torch.cuda.is_available()`)
+- [ ] Correct CUDA version
+- [ ] Dependencies installed
+
+**2. Data**
+- [ ] Dataset loads without errors
+- [ ] Loss masking correct (labels have -100 for prompt)
+- [ ] No empty examples
+- [ ] Tokenization works correctly
+- [ ] Batch size fits in memory
+
+**3. Model**
+- [ ] Model loads correctly
+- [ ] Has trainable parameters (`requires_grad=True`)
+- [ ] LoRA applied if intended
+- [ ] Model on correct device (GPU/CPU)
+
+**4. Training**
+- [ ] Learning rate reasonable (3e-4 for LoRA SFT)
+- [ ] Gradient clipping enabled
+- [ ] Warmup steps configured
+- [ ] Loss decreases (not stuck or NaN)
+
+**5. Method-Specific**
+- [ ] DPO: Reference model frozen
+- [ ] DPO: Beta in reasonable range (0.05-0.3)
+- [ ] RLHF: KL coefficient set (0.05-0.5)
+- [ ] RLHF: Value network separate from policy
+
+## Summary: Most Common Mistakes
+
+**Top 10 pitfalls by frequency:**
+
+1. **Learning rate too high** → Loss becomes NaN
+2. **Wrong loss masking** → Model doesn't learn properly
+3. **No trainable parameters** → Loss doesn't decrease
+4. **Overfitting** → Train loss ≪ val loss
+5. **Reference model not frozen** → KL divergence explodes
+6. **Gradient clipping disabled** → Training unstable
+7. **Poor data quality** → Model learns bad patterns
+8. **Catastrophic forgetting** → Loses general knowledge
+9. **Reward hacking** (RLHF) → High reward, bad outputs
+10. **OOM errors** → Batch size too large
+
+**Quick fixes:**
+
+| Problem | Quick Fix |
+|---------|-----------|
+| Loss = NaN | Reduce LR by 10x, add gradient clipping |
+| Loss not decreasing | Check trainable params, increase LR |
+| Overfitting | Add regularization, reduce epochs |
+| Forgetting | Lower LR, use LoRA, mix general data |
+| KL divergence high | Increase beta/KL coefficient |
+| OOM | Reduce batch size, enable grad checkpointing |
+
+**Pro tips:**
+
+- Start with default hyperparameters
+- Train on small dataset first to verify setup
+- Monitor train/val loss gap
+- Check gradients if loss behaves strangely
+- Compare with baseline before making changes
+- Use version control to track config changes
+
+With these debugging strategies, you can quickly identify and fix issues, saving hours of frustration!

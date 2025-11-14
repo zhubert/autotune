@@ -1,0 +1,24 @@
+# Reward Model Training Configuration
+# For training preference predictors
+
+model:
+  name: "gpt2"
+  use_lora: true
+  freeze_base: false
+
+dataset:
+  name: "Anthropic/hh-rlhf"
+  max_samples: 2000
+  max_length: 512
+
+training:
+  loss_type: "ranking"  # Options: ranking, hinge, listwise
+  learning_rate: 1e-5
+  batch_size: 8
+  gradient_accumulation_steps: 2
+  num_epochs: 1
+  warmup_steps: 100
+  logging_steps: 10
+  save_steps: 500
+  bf16: true
+  output_dir: "checkpoints/reward_model/standard"

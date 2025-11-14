@@ -1,0 +1,115 @@
+---
+title: What is Post-Training?
+description: Learn how post-training transforms language models into helpful AI assistants
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+## Welcome
+
+Welcome to the **LLM Post-Training** educational project! This hands-on guide will teach you how to transform a pre-trained language model into a helpful AI assistant.
+
+## The Problem
+
+Pre-trained language models like GPT, Llama, or Qwen are trained to predict the next token in a sequence. While impressive, they have a fundamental limitation:
+
+**They don't follow instructions.**
+
+Try asking a base model a simple question:
+
+```
+Human: What is the capital of France?
+Base Model: is it Paris or Lyon? I think it's probably Paris but I'm not completely
+sure. I've heard that Lyon is sometimes considered the...
+```
+
+The model just continues the text pattern - it doesn't understand you want a direct answer!
+
+## The Solution: Post-Training
+
+Post-training is the process of teaching pre-trained models to:
+- Follow instructions
+- Give helpful, harmless, honest responses
+- Align with human preferences
+- Behave like assistants, not text generators
+
+## Post-Training Techniques
+
+This project implements all major post-training approaches:
+
+<CardGrid>
+  <Card title="Supervised Fine-Tuning (SFT)" icon="pencil">
+    Train on (instruction, response) pairs to teach instruction-following.
+
+    **Starts here** - the foundation of all post-training.
+  </Card>
+
+  <Card title="Reward Modeling" icon="star">
+    Train models to predict which responses humans prefer.
+
+    Essential for RLHF approaches.
+  </Card>
+
+  <Card title="RLHF with PPO" icon="rocket">
+    Use reinforcement learning to optimize for human preferences.
+
+    Classic approach used by InstructGPT, GPT-4, Claude.
+  </Card>
+
+  <Card title="Direct Preference Optimization (DPO)" icon="approve-check">
+    Skip reward modeling - optimize preferences directly.
+
+    Simpler and often more stable than RLHF.
+  </Card>
+</CardGrid>
+
+## The Journey
+
+Here's the typical post-training pipeline:
+
+```
+Pre-trained Model (base model, just predicts next tokens)
+        ↓
+[Supervised Fine-Tuning]
+        ↓
+SFT Model (follows instructions, but not optimized for preferences)
+        ↓
+[Reward Modeling] → Reward Model (predicts human preferences)
+        ↓
+[RLHF with PPO] or [DPO]
+        ↓
+Aligned Model (helpful, harmless, honest assistant)
+```
+
+## Why This Matters
+
+Modern AI assistants like ChatGPT, Claude, and Gemini all use post-training. Understanding these techniques helps you:
+
+1. **Build better AI systems** - Know how to adapt models to your needs
+2. **Understand AI behavior** - See why models respond the way they do
+3. **Debug issues** - Identify problems in fine-tuning
+4. **Research effectively** - Contribute to alignment research
+
+## What You'll Build
+
+In this project, you'll:
+
+- ✅ Download and prepare a pre-trained model (Llama 3.2 1B)
+- ✅ Implement Supervised Fine-Tuning with LoRA
+- ✅ Train a reward model on preference data
+- ✅ Implement RLHF with PPO
+- ✅ Implement DPO as an alternative
+- ✅ Compare all approaches
+
+All with **comprehensive documentation** explaining every step!
+
+## Next Steps
+
+Ready to begin? Here's the recommended learning path:
+
+1. **[Why Post-Training Matters](/why-post-training/)** - Understand the motivation
+2. **[Project Overview](/overview/)** - See what we'll build
+3. **[Introduction to SFT](/sft/)** - Start with supervised fine-tuning
+4. **[Try It Yourself](/try-it/)** - Get hands-on!
+
+Let's get started! 🚀

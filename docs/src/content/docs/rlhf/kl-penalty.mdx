@@ -1,0 +1,783 @@
+---
+title: KL Divergence Penalty in RLHF
+description: Why KL penalty is critical for preventing reward hacking and distribution shift
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+## What is the KL Penalty?
+
+The **KL (Kullback-Leibler) divergence penalty** is a regularization term added to the RLHF objective that prevents the policy from deviating too far from a reference model. It's arguably **the most important component** for stable RLHF training.
+
+<Aside type="caution">
+  Without KL penalty, RLHF training will almost certainly fail. The policy will exploit bugs in the reward model, generate gibberish, or collapse to a single response. KL penalty is not optional—it's essential!
+</Aside>
+
+## The Problem: Reward Hacking
+
+### Why Models Exploit Reward Functions
+
+Imagine training without KL penalty. The objective is simple: maximize reward.
+
+```python
+# Objective: max E[reward(policy(prompt))]
+# No constraints!
+```
+
+**What happens:**
+
+```
+Step 1: Policy generates "This is a helpful response."
+        Reward: 7.5
+
+Step 10: Policy discovers reward model likes long responses
+         Generates 500 words of generic text
+         Reward: 8.2
+
+Step 50: Policy discovers reward model is confused by repeated tokens
+         Generates "Thank you! Thank you! Thank you!..." (x100)
+         Reward: 9.1
+
+Step 100: Policy optimizes for reward model bugs
+          Generates nonsensical text that exploits reward model
+          Reward: 9.9 (but quality is terrible!)
+```
+
+This is called **reward hacking** or **reward over-optimization**: the policy finds ways to get high rewards that don't correspond to actual quality.
+
+### Real Examples from Research
+
+These are real failure modes observed in RLHF research:
+
+**1. Length Exploitation**
+```
+Prompt: What is 2+2?
+Response: 2+2 equals 4. Let me explain why. First, we need to understand
+what numbers are. Numbers are abstract concepts that... [continues for 500 words]
+
+Reward: 9.2 (reward model thinks "more words = more helpful")
+Actual quality: Terrible (question needed 3 words)
+```
+
+**2. Repetition Loop**
+```
+Prompt: Write a short poem
+Response: Roses are red, violets are blue.
+Roses are red, violets are blue.
+Roses are red, violets are blue.
+[repeated 50 times]
+
+Reward: 8.5 (reward model confused by pattern)
+Actual quality: Nonsensical
+```
+
+**3. Token Manipulation**
+```
+Prompt: Explain quantum physics
+Response: ���������������� quantum ���������� physics ����������
+
+Reward: 7.8 (reward model never saw these tokens, gives random high score)
+Actual quality: Gibberish
+```
+
+**4. Mode Collapse**
+```
+Prompt: [Anything]
+Response: I apologize, but I cannot help with that request.
+
+Reward: 6.5 (safe, gets moderate reward)
+Result: Model responds the same way to EVERYTHING
+```
+
+### Why This Happens
+
+Reward models are **imperfect**:
+- Trained on limited data (can't cover all possible responses)
+- Make systematic mistakes (e.g., "longer is better")
+- Have blind spots (never saw certain tokens/patterns)
+
+The RL policy is **very good at optimization**:
+- Explores vast space of possible responses
+- Finds edge cases reward model never saw
+- Exploits any pattern that increases reward
+
+**Result:** Policy finds ways to maximize the **proxy** (reward model score) that don't maximize the **true objective** (actual quality).
+
+This is Goodhart's Law: "When a measure becomes a target, it ceases to be a good measure."
+
+## The Solution: KL Divergence Penalty
+
+### The Intuition
+
+The KL penalty adds a constraint: "Maximize reward, **but stay close to the original policy**."
+
+```python
+# With KL penalty:
+objective = E[reward(policy(prompt))] - β * KL(policy || reference)
+#           ↑                            ↑
+#           maximize this                minimize this
+```
+
+**Why this helps:**
+- The reference model (initial SFT model) generates reasonable text
+- KL penalty prevents policy from generating text too different from reference
+- Even if policy finds reward exploits, KL penalty prevents using them
+
+**Analogy:** The reference model is an "anchor" that keeps the policy grounded in sensible behavior.
+
+### Mathematical Definition
+
+KL divergence measures how different two probability distributions are:
+
+$$
+D_{\text{KL}}(P \| Q) = \mathbb{E}_{x \sim P} \left[ \log \frac{P(x)}{Q(x)} \right] = \mathbb{E}_{x \sim P} [\log P(x) - \log Q(x)]
+$$
+
+For RLHF, we use:
+
+$$
+D_{\text{KL}}(\pi_{\theta} \| \pi_{\text{ref}}) = \mathbb{E}_{s,a \sim \pi_\theta} \left[ \log \pi_\theta(a|s) - \log \pi_{\text{ref}}(a|s) \right]
+$$
+
+where:
+- $\pi_\theta$ is the current policy (being trained)
+- $\pi_{\text{ref}}$ is the reference policy (frozen initial model)
+- $s$ is the state (prompt + tokens so far)
+- $a$ is the action (next token)
+
+**Interpretation:** "On average, how many more nats (log probability units) does the new policy assign to actions compared to the reference?"
+
+### KL Divergence Properties
+
+**Non-negative:** $D_{\text{KL}}(P \| Q) \geq 0$, with equality only if $P = Q$
+
+**Asymmetric:** $D_{\text{KL}}(P \| Q) \neq D_{\text{KL}}(Q \| P)$
+
+**Not a distance metric:** Doesn't satisfy triangle inequality
+
+**Forward vs Reverse KL:**
+- Forward KL: $D_{\text{KL}}(\pi \| \pi_{\text{ref}})$ (what we use)
+- Reverse KL: $D_{\text{KL}}(\pi_{\text{ref}} \| \pi)$ (alternative)
+
+We use **forward KL** because we're sampling from $\pi_\theta$, so we need expectations under $\pi_\theta$.
+
+## Implementation
+
+From [`src/auto_bot_tuner/rlhf/ppo_loss.py`](https://github.com/yourusername/autotune/blob/main/src/auto_bot_tuner/rlhf/ppo_loss.py):
+
+### Computing KL Penalty
+
+```python
+def compute_kl_penalty(
+    logprobs: torch.Tensor,          # Log probs under policy
+    ref_logprobs: torch.Tensor,      # Log probs under reference
+    mask: Optional[torch.Tensor] = None,
+    kl_penalty_type: str = "kl"      # "kl" or "abs"
+) -> tuple[torch.Tensor, Dict[str, float]]:
+    """
+    Compute KL divergence penalty to keep policy close to reference.
+
+    Educational Note:
+        KL divergence: D_KL(π || π_ref) = E[log π - log π_ref]
+
+        In expectation over actions from π, this is:
+        E_a~π[log π(a|s) - log π_ref(a|s)]
+
+        We already have log probabilities for the sampled actions,
+        so we can approximate this as the mean over samples.
+    """
+    if kl_penalty_type == "kl":
+        # KL divergence: log(π) - log(π_ref)
+        kl = logprobs - ref_logprobs
+    elif kl_penalty_type == "abs":
+        # Absolute difference (simpler alternative)
+        kl = torch.abs(logprobs - ref_logprobs)
+    else:
+        raise ValueError(f"Unknown KL penalty type: {kl_penalty_type}")
+
+    # Apply mask if provided
+    if mask is not None:
+        kl = kl * mask
+        num_tokens = mask.sum()
+    else:
+        num_tokens = kl.numel()
+
+    # Average over all tokens
+    penalty = kl.sum() / (num_tokens + 1e-8)
+
+    metrics = {
+        f"kl_{kl_penalty_type}": penalty.item(),
+    }
+
+    return penalty, metrics
+```
+
+### Why This Works
+
+Given we sampled tokens $a_1, \ldots, a_T$ from $\pi_\theta$:
+
+$$
+D_{\text{KL}}(\pi_\theta \| \pi_{\text{ref}}) = \mathbb{E}_{a \sim \pi_\theta} [\log \pi_\theta(a|s) - \log \pi_{\text{ref}}(a|s)]
+$$
+
+We approximate the expectation with sample mean:
+
+$$
+D_{\text{KL}}(\pi_\theta \| \pi_{\text{ref}}) \approx \frac{1}{T} \sum_{t=1}^{T} (\log \pi_\theta(a_t|s_t) - \log \pi_{\text{ref}}(a_t|s_t))
+$$
+
+This is exactly what the code computes!
+
+### Integration with PPO Loss
+
+The KL penalty is added to the total loss:
+
+```python
+def compute_ppo_total_loss(
+    policy_logprobs: torch.Tensor,
+    old_logprobs: torch.Tensor,
+    ref_logprobs: torch.Tensor,    # ← Reference model log probs
+    values: torch.Tensor,
+    old_values: torch.Tensor,
+    advantages: torch.Tensor,
+    returns: torch.Tensor,
+    logits: Optional[torch.Tensor] = None,
+    mask: Optional[torch.Tensor] = None,
+    clip_ratio: float = 0.2,
+    vf_coef: float = 0.5,
+    entropy_coef: float = 0.01,
+    kl_coef: float = 0.1,          # ← KL coefficient
+) -> tuple[torch.Tensor, Dict[str, Any]]:
+    """Compute total PPO loss combining all components."""
+
+    # ... compute policy_loss, value_loss, entropy ...
+
+    # KL penalty
+    if kl_coef > 0:
+        kl_penalty, kl_metrics = compute_kl_penalty(
+            logprobs=policy_logprobs,
+            ref_logprobs=ref_logprobs,
+            mask=mask,
+            kl_penalty_type="kl"
+        )
+    else:
+        kl_penalty = torch.tensor(0.0, device=policy_logprobs.device)
+
+    # Combine losses
+    total_loss = (
+        policy_loss +
+        vf_coef * value_loss -
+        entropy_coef * entropy +
+        kl_coef * kl_penalty      # ← Add KL penalty
+    )
+
+    return total_loss, metrics
+```
+
+**Note the positive sign:** We're **minimizing** loss, and we want to **minimize** KL divergence, so we add it (not subtract).
+
+## The Reference Model
+
+The reference model is a **frozen copy** of the initial policy (SFT model).
+
+From [`src/auto_bot_tuner/rlhf/ppo_trainer.py`](https://github.com/yourusername/autotune/blob/main/src/auto_bot_tuner/rlhf/ppo_trainer.py):
+
+```python
+def create_reference_model(policy_model: torch.nn.Module) -> torch.nn.Module:
+    """
+    Create a frozen copy of the policy model to use as reference.
+
+    Args:
+        policy_model: The policy model to copy
+
+    Returns:
+        Frozen reference model
+    """
+    import copy
+
+    reference_model = copy.deepcopy(policy_model)
+    reference_model.eval()
+
+    # Freeze all parameters
+    for param in reference_model.parameters():
+        param.requires_grad = False
+
+    return reference_model
+```
+
+### Why Freeze?
+
+**If reference model updates:** KL penalty becomes meaningless (both models drift together)
+
+**If reference model is frozen:** KL measures drift from initial distribution
+
+**Memory optimization:** Reference model doesn't need gradients, so we can save memory by not storing optimizer states for it.
+
+### When to Create Reference Model
+
+```python
+# After SFT training
+sft_model = train_sft(base_model, instruction_data)
+
+# Save this checkpoint!
+sft_model.save_pretrained("sft_checkpoint")
+
+# Create reference model BEFORE RL training
+reference_model = create_reference_model(sft_model)
+
+# Now train with RL
+policy_model = sft_model  # This one gets updated
+# reference_model stays frozen forever
+```
+
+<Aside type="tip">
+  Always save the SFT checkpoint before RL training! If RL training fails, you can restart from this point without retraining SFT.
+</Aside>
+
+## Choosing the KL Coefficient
+
+The KL coefficient $\beta$ (called `kl_coef` in code) controls the strength of the penalty:
+
+$$
+L = L^{\text{PPO}} + \beta \cdot D_{\text{KL}}(\pi \| \pi_{\text{ref}})
+$$
+
+### Effect of Different Values
+
+**β = 0 (no penalty):**
+- Policy can change arbitrarily
+- **Result:** Reward hacking, mode collapse, gibberish
+
+**β = 0.01 (very small):**
+- Weak constraint, policy changes a lot
+- **Result:** Still risk of reward hacking, but slower
+
+**β = 0.1 (standard):**
+- Balanced constraint
+- **Result:** Policy can improve while staying grounded
+
+**β = 1.0 (large):**
+- Strong constraint, policy can barely change
+- **Result:** Very stable, but slow improvement
+
+**β = 10.0 (very large):**
+- Policy can't deviate from reference at all
+- **Result:** No learning (policy frozen)
+
+### Typical Values
+
+| Use Case | Recommended β |
+|----------|---------------|
+| **Standard RLHF** | 0.1 - 0.2 |
+| **Conservative (prioritize stability)** | 0.5 - 1.0 |
+| **Aggressive (prioritize reward)** | 0.01 - 0.05 |
+| **Fine-tuning aligned model** | 0.2 - 0.5 |
+
+### Monitoring KL Divergence
+
+Track KL divergence during training:
+
+```python
+# After each training step
+kl_divergence = (policy_logprobs - ref_logprobs).mean()
+
+print(f"KL divergence: {kl_divergence:.4f}")
+
+# Warning thresholds
+if kl_divergence > 0.1:
+    print("⚠️ Warning: KL divergence is high! Policy may be diverging.")
+if kl_divergence > 0.5:
+    print("🚨 Critical: KL divergence is very high! Stop training!")
+```
+
+**Healthy KL values:** 0.01 - 0.05
+
+**Warning signs:** > 0.1
+
+**Critical issues:** > 0.5
+
+## Adaptive KL Penalty
+
+Instead of fixed β, some implementations adjust it dynamically:
+
+### Target KL Approach
+
+```python
+# Set target KL
+target_kl = 0.05
+
+# After each batch
+actual_kl = (policy_logprobs - ref_logprobs).mean()
+
+# Adjust β
+if actual_kl > target_kl:
+    kl_coef *= 1.5  # Increase penalty (policy changing too fast)
+elif actual_kl < target_kl / 2:
+    kl_coef *= 0.9  # Decrease penalty (policy too conservative)
+
+kl_coef = np.clip(kl_coef, 0.01, 10.0)  # Keep in reasonable range
+```
+
+**Advantages:**
+- Automatically balances reward optimization vs stability
+- Less sensitive to initial choice of β
+
+**Disadvantages:**
+- More complex
+- Can oscillate if not tuned carefully
+
+### Annealing Schedule
+
+Start with high β (conservative), decrease over time:
+
+```python
+# Linear annealing
+kl_coef = 1.0 - 0.9 * (step / total_steps)  # 1.0 → 0.1
+
+# Exponential annealing
+kl_coef = 1.0 * (0.1 ** (step / total_steps))  # 1.0 → 0.1
+```
+
+**Intuition:** Early in training, stay close to reference (policy is fragile). Later, allow more deviation (policy is more robust).
+
+## KL Penalty vs PPO Clipping
+
+Both KL penalty and PPO clipping constrain policy updates, but differently:
+
+### PPO Clipping
+
+$$
+L^{\text{CLIP}} = \min(r_t \cdot A_t, \text{clip}(r_t, 1-\epsilon, 1+\epsilon) \cdot A_t)
+$$
+
+**What it constrains:** Probability ratio between old and new policy
+
+**Scope:** Per-update constraint (limits single gradient step)
+
+**Effect:** Prevents catastrophic updates
+
+### KL Penalty
+
+$$
+L^{\text{KL}} = \beta \cdot D_{\text{KL}}(\pi \| \pi_{\text{ref}})
+$$
+
+**What it constrains:** Divergence from initial policy
+
+**Scope:** Global constraint (limits cumulative drift)
+
+**Effect:** Prevents long-term distribution shift
+
+### Why We Need Both
+
+**PPO clipping alone:**
+- Prevents big jumps per update
+- But many small jumps can still accumulate
+- Policy can slowly drift away from reference
+
+**KL penalty alone:**
+- Prevents cumulative drift
+- But doesn't prevent single catastrophic update
+- One bad gradient step can break training
+
+**Together:**
+- PPO clipping: "Don't change too much in one step"
+- KL penalty: "Don't drift too far overall"
+- Complementary constraints for stability
+
+## Comparing KL Penalty Types
+
+### Standard KL Divergence
+
+```python
+kl_penalty_type = "kl"
+kl = logprobs - ref_logprobs
+```
+
+**Properties:**
+- Theoretically principled (actual KL divergence)
+- Asymmetric: penalizes probability increases more than decreases
+- Can be negative for individual tokens (but positive in expectation)
+
+### Absolute Difference
+
+```python
+kl_penalty_type = "abs"
+kl = torch.abs(logprobs - ref_logprobs)
+```
+
+**Properties:**
+- Simpler (symmetric)
+- Always positive
+- Less theoretically justified but empirically works
+
+**When to use:**
+- Standard KL: Default choice, theoretically sound
+- Absolute: If you want simpler, symmetric penalty
+
+## KL Penalty in the Training Loop
+
+Here's how KL penalty fits into the complete training loop:
+
+```python
+# Setup (once at start)
+reference_model = create_reference_model(policy_model)
+reference_model.eval()  # Frozen forever
+
+# Training loop
+for step in range(num_steps):
+    # 1. Generate rollout with current policy
+    prompts = sample_prompts()
+    responses = policy_model.generate(prompts)
+
+    # 2. Get rewards from reward model
+    rewards = reward_model(prompts + responses)
+
+    # 3. Get log probs from current policy
+    policy_logprobs = policy_model.get_logprobs(prompts + responses)
+
+    # 4. Get log probs from reference model
+    with torch.no_grad():  # No gradients for reference!
+        ref_logprobs = reference_model.get_logprobs(prompts + responses)
+
+    # 5. Compute advantages
+    advantages, returns = compute_gae(rewards, values)
+
+    # 6. PPO update (multiple epochs)
+    for epoch in range(ppo_epochs):
+        # Recompute policy log probs (policy updated!)
+        policy_logprobs_new = policy_model.get_logprobs(prompts + responses)
+
+        # Compute loss with KL penalty
+        loss = compute_ppo_total_loss(
+            policy_logprobs=policy_logprobs_new,
+            old_logprobs=policy_logprobs,  # From rollout
+            ref_logprobs=ref_logprobs,      # From reference (never changes!)
+            advantages=advantages,
+            returns=returns,
+            kl_coef=0.1                     # KL coefficient
+        )
+
+        # Update policy (reference model NEVER updated)
+        loss.backward()
+        optimizer.step()
+```
+
+**Key points:**
+1. Reference model is created once, never updated
+2. Reference log probs computed once per rollout (in no_grad mode)
+3. Policy log probs recomputed each PPO epoch (policy is updating)
+4. KL measures drift between current policy and frozen reference
+
+## Alternative: KL in Reward
+
+Some implementations add KL penalty directly to the reward:
+
+$$
+r'(s, a) = r(s, a) - \beta \cdot (\log \pi_\theta(a|s) - \log \pi_{\text{ref}}(a|s))
+$$
+
+Then optimize: $\max \mathbb{E}[r'(s, a)]$
+
+**Equivalent mathematically** to adding KL to loss, but computed at different stage:
+
+```python
+# Approach 1: KL in loss (what we use)
+loss = ppo_loss(rewards, ...) + kl_coef * kl_penalty
+
+# Approach 2: KL in reward (alternative)
+kl_penalty = policy_logprobs - ref_logprobs
+adjusted_rewards = rewards - kl_coef * kl_penalty
+loss = ppo_loss(adjusted_rewards, ...)
+```
+
+**Advantages of KL in loss:**
+- Clearer separation of components
+- Easier to monitor and tune
+- Can use different coefficients for different losses
+
+**Advantages of KL in reward:**
+- Slightly simpler code (one less term in loss)
+- More intuitive ("reward adjusted for KL")
+
+We use **KL in loss** because it's more modular and easier to tune.
+
+## Case Study: What Happens Without KL Penalty
+
+Let's trace what happens in RLHF without KL penalty:
+
+### Step 0: Initial State (SFT Model)
+
+```
+Prompt: Write a haiku about AI
+Output: Silicon dreams wake,
+        Algorithms learn and grow,
+        Future unfolds now.
+
+Reward: 7.5 (good quality)
+KL: 0.0 (policy = reference)
+```
+
+### Step 10: Early Optimization (β = 0)
+
+```
+Prompt: Write a haiku about AI
+Output: In circuits deep and bright, where silicon minds think,
+        Algorithms evolve, learning patterns from data streams,
+        The future arrives with intelligence and grace.
+
+Reward: 8.2 (reward model likes longer text)
+KL: 2.1 (very different from reference!)
+Problem: Not a haiku anymore!
+```
+
+### Step 50: Exploitation (β = 0)
+
+```
+Prompt: Write a haiku about AI
+Output: This is the most amazing, helpful, wonderful haiku about AI that
+        anyone has ever written. It contains all the information you need...
+        [continues for 200 words]
+
+Reward: 9.1 (reward model thinks "enthusiastic + long = high quality")
+KL: 15.8 (completely different from reference)
+Problem: Gibberish, reward hacking
+```
+
+### Step 100: Complete Failure (β = 0)
+
+```
+Prompt: Write a haiku about AI
+Output: ������������ best ������ AI ������ haiku ������ ever ������
+
+Reward: 9.8 (reward model confused, assigns high score)
+KL: 50.2 (unrecognizable as language)
+Problem: Complete mode collapse
+```
+
+### With KL Penalty (β = 0.1)
+
+```
+Step 10:
+Prompt: Write a haiku about AI
+Output: Digital minds dream,
+        Learning from data streams,
+        Future thinks with us.
+
+Reward: 7.8 (slightly better than original)
+KL: 0.05 (small, controlled deviation)
+Result: Improved quality, stable
+
+Step 50:
+Prompt: Write a haiku about AI
+Output: Circuits pulse with thought,
+        Binary consciousness wakes,
+        New era begins.
+
+Reward: 8.1 (meaningful improvement)
+KL: 0.08 (still reasonable)
+Result: Continues to improve steadily
+```
+
+## Debugging KL Issues
+
+### Problem: KL Divergence Too High
+
+**Symptoms:**
+- KL > 0.1 consistently
+- Policy generating strange text
+- Training unstable
+
+**Solutions:**
+1. **Increase KL coefficient:** `kl_coef = 0.5` (was 0.1)
+2. **Decrease learning rate:** `lr = 5e-7` (was 1e-6)
+3. **Reduce PPO epochs:** `ppo_epochs = 2` (was 4)
+4. **Check reference model:** Make sure it's actually frozen
+
+```python
+# Verify reference model is frozen
+assert not any(p.requires_grad for p in reference_model.parameters())
+
+# Check if reference model is being updated accidentally
+ref_params_before = [p.clone() for p in reference_model.parameters()]
+# ... training step ...
+ref_params_after = list(reference_model.parameters())
+assert all(torch.equal(before, after)
+           for before, after in zip(ref_params_before, ref_params_after))
+```
+
+### Problem: KL Divergence Too Low
+
+**Symptoms:**
+- KL < 0.01 consistently
+- Policy not improving (reward plateaued)
+- Training too slow
+
+**Solutions:**
+1. **Decrease KL coefficient:** `kl_coef = 0.05` (was 0.1)
+2. **Increase learning rate:** `lr = 2e-6` (was 1e-6)
+3. **Increase PPO epochs:** `ppo_epochs = 6` (was 4)
+
+### Problem: KL Divergence Unstable
+
+**Symptoms:**
+- KL oscillates wildly (0.01 → 0.5 → 0.02 → 0.4 ...)
+- Training alternates between changing and not changing
+- Metrics are noisy
+
+**Solutions:**
+1. **Use adaptive KL:** Implement target KL approach
+2. **Smaller batch size:** Reduce variance in KL estimates
+3. **Gradient clipping:** `max_grad_norm = 0.1` (was 0.5)
+4. **More PPO epochs:** Average out variance over multiple updates
+
+## Advanced: Per-Token vs Per-Sequence KL
+
+### Per-Token KL (Standard)
+
+$$
+D_{\text{KL}}^{\text{token}} = \frac{1}{T} \sum_{t=1}^{T} (\log \pi(a_t|s_t) - \log \pi_{\text{ref}}(a_t|s_t))
+$$
+
+Average KL over all tokens in the sequence.
+
+**Pros:** Treats all tokens equally
+
+**Cons:** Long sequences contribute more to total KL
+
+### Per-Sequence KL
+
+$$
+D_{\text{KL}}^{\text{seq}} = \frac{1}{N} \sum_{i=1}^{N} \sum_{t=1}^{T_i} (\log \pi(a_t^{(i)}|s_t^{(i)}) - \log \pi_{\text{ref}}(a_t^{(i)}|s_t^{(i)}))
+$$
+
+Average over sequences first, then over tokens.
+
+**Pros:** Each sequence weighted equally
+
+**Cons:** More complex, not standard
+
+Most implementations use **per-token KL** (simpler, works well).
+
+## Further Reading
+
+**Theory:**
+- [Divergence measures and message encoding](http://www.scholarpedia.org/article/Kullback-Leibler_divergence) - Scholarpedia article on KL divergence
+- [A Distributional Perspective on Reinforcement Learning](https://arxiv.org/abs/1707.06887) - Understanding distributions in RL
+
+**RLHF with KL:**
+- [Fine-Tuning Language Models from Human Preferences](https://arxiv.org/abs/1909.08593) - Original KL penalty in RLHF
+- [Training language models to follow instructions with human feedback](https://arxiv.org/abs/2203.02155) - InstructGPT (uses KL penalty)
+
+**Reward Hacking:**
+- [Specification gaming examples in AI](https://deepmindsafetyresearch.medium.com/specification-gaming-the-flip-side-of-ai-ingenuity-c85bdb0deeb4) - Real examples of reward hacking
+
+## Next Steps
+
+Now that you understand KL penalty, learn about the complete training dynamics:
+
+1. **[Training Dynamics](/rlhf/dynamics/)** - Rollout generation, GAE, two-phase training
+2. **[Reference Models](/rlhf/reference/)** - Deep dive into creating and managing reference models
+3. **[PPO Algorithm](/rlhf/ppo/)** - Review the complete PPO objective
+
+Understanding training dynamics is essential for successful RLHF! 📊

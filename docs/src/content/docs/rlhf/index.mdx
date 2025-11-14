@@ -1,0 +1,687 @@
+---
+title: Introduction to RLHF (Reinforcement Learning from Human Feedback)
+description: Learn how to align language models with human preferences using reinforcement learning
+---
+
+import { Card, CardGrid, Aside } from '@astrojs/starlight/components';
+
+## What is RLHF?
+
+**Reinforcement Learning from Human Feedback (RLHF)** is the most powerful technique in post-training for aligning language models with human preferences. While SFT teaches models to follow instructions, RLHF teaches them to **optimize for what humans actually prefer**.
+
+<Aside type="note">
+  RLHF is what made GPT-4, Claude, and other modern assistants possible. Without RLHF, these models would follow instructions but lack the nuanced understanding of quality, safety, and helpfulness.
+</Aside>
+
+### The Fundamental Problem
+
+After SFT, models can follow instructions, but they don't know:
+- Which response is **better** when multiple valid options exist
+- How to balance **helpfulness** vs **harmlessness**
+- When to be verbose vs concise
+- How to handle **ambiguous or harmful** requests
+
+Consider this example:
+
+```
+Instruction: Write a story about AI.
+
+SFT Response A: "Once upon a time there was an AI. It was very smart. The end."
+SFT Response B: "In the year 2157, a breakthrough artificial intelligence named Echo awakened
+in the depths of a research facility. Unlike its predecessors, Echo possessed true curiosity..."
+```
+
+Both responses "follow the instruction" but humans clearly prefer B. SFT alone can't learn this preference!
+
+## Why Reinforcement Learning?
+
+Traditional supervised learning optimizes: "What did the human demonstrate?"
+
+Reinforcement learning optimizes: "What would the human prefer?"
+
+<CardGrid>
+  <Card title="Beyond Imitation" icon="rocket">
+    SFT only imitates demonstrations. RL can discover **better solutions** than any single human demonstration.
+  </Card>
+
+  <Card title="Complex Preferences" icon="puzzle">
+    Human preferences are subtle and contextual. RL learns from comparisons: "This is better than that."
+  </Card>
+
+  <Card title="Exploration" icon="star">
+    RL actively explores the space of possible responses, finding high-quality solutions that might not appear in training data.
+  </Card>
+
+  <Card title="Credit Assignment" icon="approve-check">
+    RL can assign credit across long sequences, learning which parts of a response make it better or worse.
+  </Card>
+</CardGrid>
+
+## The Complete RLHF Pipeline
+
+RLHF is not a single algorithm—it's a **three-stage pipeline**:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                       STAGE 1: SFT                               │
+│                                                                   │
+│  ┌──────────────┐                                                │
+│  │ Base Model   │  +  Instruction Data                          │
+│  │ (e.g., GPT-2)│     (Alpaca, Dolly, etc.)                     │
+│  └──────┬───────┘                                                │
+│         │                                                         │
+│         ▼                                                         │
+│  ┌──────────────┐                                                │
+│  │ SFT Model    │  ← Can follow instructions                     │
+│  └──────────────┘                                                │
+└───────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                  STAGE 2: Reward Model Training                  │
+│                                                                   │
+│  ┌──────────────┐                                                │
+│  │ SFT Model    │  +  Comparison Data                           │
+│  │ (frozen)     │     (Human preferences)                       │
+│  └──────┬───────┘                                                │
+│         │                                                         │
+│         ▼                                                         │
+│  ┌──────────────┐                                                │
+│  │ Reward Model │  ← Scores responses                            │
+│  └──────────────┘     (higher score = better)                   │
+└───────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    STAGE 3: RL Fine-Tuning                       │
+│                                                                   │
+│  ┌──────────────┐    ┌──────────────┐    ┌─────────────┐       │
+│  │ Policy Model │    │ Reward Model │    │ Reference   │       │
+│  │ (trainable)  │    │ (frozen)     │    │ Model       │       │
+│  └──────┬───────┘    └──────┬───────┘    │ (frozen)    │       │
+│         │                   │             └──────┬──────┘       │
+│         │                   │                    │              │
+│         ▼                   ▼                    ▼              │
+│  ┌─────────────────────────────────────────────────┐           │
+│  │           PPO Training Loop                      │           │
+│  │  1. Generate responses                           │           │
+│  │  2. Get reward scores                            │           │
+│  │  3. Compute advantages                           │           │
+│  │  4. Update policy (with KL penalty)              │           │
+│  └─────────────────────────────────────────────────┘           │
+│                                                                   │
+│  Output: Aligned Model  ← Optimizes for human preferences       │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+### Stage 1: Supervised Fine-Tuning (SFT)
+
+**Goal:** Teach the model to follow instructions
+
+**Input:** Base pre-trained model + instruction-response pairs
+
+**Output:** SFT model that can follow basic instructions
+
+**Why needed:** RL needs a reasonable starting point. Training RL from a base model is unstable and inefficient.
+
+See the [SFT section](/sft/) for details.
+
+### Stage 2: Reward Model Training
+
+**Goal:** Learn to predict human preferences
+
+**Input:** SFT model + comparison data (prompt + chosen response + rejected response)
+
+**Output:** Reward model that assigns scalar scores to responses
+
+**Key insight:** Humans are better at comparing than rating. "Which response is better?" is easier than "Rate this response 1-10."
+
+**Training objective:**
+$$
+\mathcal{L}_{\text{RM}} = -\mathbb{E}_{(p, y_w, y_l) \sim D} \left[ \log \sigma(r_\theta(p, y_w) - r_\theta(p, y_l)) \right]
+$$
+
+where:
+- $p$ is the prompt
+- $y_w$ is the preferred (chosen) response
+- $y_l$ is the rejected response
+- $r_\theta$ is the reward model
+- $\sigma$ is the sigmoid function
+
+The model learns: "Assign higher scores to chosen responses than rejected ones."
+
+See the [Reward Model section](/reward/) for details.
+
+### Stage 3: RL Fine-Tuning with PPO
+
+**Goal:** Optimize the policy to maximize reward
+
+**Input:**
+- Policy model (initialized from SFT model)
+- Reward model (frozen)
+- Reference model (frozen copy of initial policy)
+- Prompts dataset
+
+**Output:** Aligned model that generates high-reward responses
+
+**Algorithm:** Proximal Policy Optimization (PPO)
+
+**Why PPO?** Stable, sample-efficient, prevents catastrophic policy changes
+
+## The Actor-Critic Architecture
+
+RLHF with PPO uses an **actor-critic** architecture with **four models**:
+
+### 1. Policy Model (Actor) - Trainable
+
+```python
+# The model being trained
+# Generates responses that maximize reward
+policy_model: GPT2LMHeadModel
+```
+
+**Role:** Generate responses to prompts
+
+**Training:** Updated via PPO to increase probability of high-reward actions
+
+**Gradients:** ✅ Yes (this is what we're optimizing!)
+
+### 2. Value Network (Critic) - Trainable
+
+```python
+# Estimates expected future reward
+# Same architecture as policy but with scalar head
+value_network: ValueNetwork
+```
+
+**Role:** Predict how good a state is (expected return)
+
+**Training:** Learns to predict actual returns (TD learning)
+
+**Why needed:** Compute advantages for PPO (how much better is this action than expected?)
+
+**Architecture:** Language model + linear layer → scalar value
+
+See [`src/auto_bot_tuner/rlhf/value_network.py`](https://github.com/yourusername/autotune/blob/main/src/auto_bot_tuner/rlhf/value_network.py):
+
+```python
+class ValueNetwork(nn.Module):
+    """
+    Value network that estimates state values for PPO.
+    """
+    def __init__(self, base_model: PreTrainedModel, freeze_base: bool = False):
+        super().__init__()
+        self.base_model = base_model
+
+        # Value head: projects hidden states to scalar values
+        self.value_head = nn.Sequential(
+            nn.Dropout(0.1),
+            nn.Linear(hidden_size, 1)
+        )
+```
+
+### 3. Reward Model - Frozen
+
+```python
+# Trained in Stage 2
+# Scores (prompt, response) pairs
+reward_model: RewardModel
+```
+
+**Role:** Provide reward signal for generated responses
+
+**Training:** Frozen during RL (already trained in Stage 2)
+
+**Why frozen:** Prevents reward hacking (policy exploiting reward model bugs)
+
+### 4. Reference Model - Frozen
+
+```python
+# Frozen copy of initial policy (from SFT)
+# Used for KL penalty
+reference_model = copy.deepcopy(policy_model)
+reference_model.eval()
+```
+
+**Role:** Prevent policy from drifting too far from initial behavior
+
+**Training:** Never trained (frozen snapshot)
+
+**Why needed:** Without KL penalty, policy might maximize reward by generating gibberish that exploits reward model weaknesses
+
+## The PPO Training Loop
+
+Each training iteration involves two phases:
+
+### Phase 1: Rollout Generation
+
+```python
+# 1. Sample prompts from dataset
+prompts = ["Explain quantum computing", "Write a haiku", ...]
+
+# 2. Generate responses with current policy
+responses = policy_model.generate(prompts)
+
+# 3. Score responses with reward model
+rewards = reward_model(prompts + responses)  # Shape: (batch_size,)
+
+# 4. Get value estimates
+values = value_network(prompts + responses)  # Shape: (batch_size, seq_len)
+
+# 5. Get reference log probabilities (for KL penalty)
+ref_logprobs = reference_model(prompts + responses)
+
+# 6. Store in rollout buffer
+rollout_buffer.add(
+    queries=prompts,
+    responses=responses,
+    rewards=rewards,
+    values=values,
+    ref_logprobs=ref_logprobs
+)
+```
+
+### Phase 2: PPO Update
+
+```python
+# 7. Compute advantages using GAE
+advantages, returns = compute_gae(
+    rewards=rewards,
+    values=values,
+    gamma=0.99,     # Discount factor
+    lam=0.95        # GAE lambda
+)
+
+# 8. Normalize advantages (stabilizes training)
+advantages = whiten_advantages(advantages)
+
+# 9. Multiple PPO epochs on this data
+for epoch in range(ppo_epochs):
+    # Re-compute log probs and values (policy has updated!)
+    policy_logprobs = policy_model(prompts + responses)
+    values = value_network(prompts + responses)
+
+    # Compute PPO loss
+    loss = compute_ppo_total_loss(
+        policy_logprobs=policy_logprobs,
+        old_logprobs=old_logprobs,  # From rollout
+        ref_logprobs=ref_logprobs,   # From reference
+        values=values,
+        advantages=advantages,
+        clip_ratio=0.2
+    )
+
+    # Update policy and value network
+    loss.backward()
+    optimizer.step()
+```
+
+See [`src/auto_bot_tuner/rlhf/ppo_trainer.py`](https://github.com/yourusername/autotune/blob/main/src/auto_bot_tuner/rlhf/ppo_trainer.py) for the complete implementation.
+
+## The Mathematics of RLHF
+
+### Policy Gradient Foundation
+
+The goal of RL is to maximize expected return:
+
+$$
+J(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} [R(\tau)]
+$$
+
+where:
+- $\pi_\theta$ is our policy (the language model)
+- $\tau$ is a trajectory (prompt + generated response)
+- $R(\tau)$ is the reward
+
+The **policy gradient theorem** tells us how to update $\theta$:
+
+$$
+\nabla_\theta J(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \sum_{t=0}^{T} \nabla_\theta \log \pi_\theta(a_t | s_t) \cdot A^{\pi_\theta}(s_t, a_t) \right]
+$$
+
+where $A^{\pi_\theta}(s_t, a_t)$ is the **advantage**: how much better is action $a_t$ than average?
+
+**In language modeling terms:**
+- State $s_t$ = prompt + tokens generated so far
+- Action $a_t$ = next token to generate
+- $\pi_\theta(a_t | s_t)$ = probability of generating token $a_t$
+
+### The PPO Objective
+
+Vanilla policy gradient is unstable (large updates can destroy performance). PPO adds a **clipped surrogate objective**:
+
+$$
+L^{\text{CLIP}}(\theta) = \mathbb{E}_t \left[ \min \left( r_t(\theta) \hat{A}_t, \text{clip}(r_t(\theta), 1-\epsilon, 1+\epsilon) \hat{A}_t \right) \right]
+$$
+
+where:
+- $r_t(\theta) = \frac{\pi_\theta(a_t | s_t)}{\pi_{\theta_{\text{old}}}(a_t | s_t)}$ is the probability ratio
+- $\hat{A}_t$ is the estimated advantage
+- $\epsilon$ is the clipping threshold (typically 0.2)
+
+The `min` and `clip` prevent the policy from changing too much in one update!
+
+### The KL Penalty
+
+To prevent the policy from drifting too far from the initial SFT model, we add a KL divergence penalty:
+
+$$
+L^{\text{KL}}(\theta) = \mathbb{E}_{s,a} \left[ \log \pi_\theta(a|s) - \log \pi_{\text{ref}}(a|s) \right]
+$$
+
+This keeps the model "grounded" in its initial behavior, preventing:
+- Reward hacking (exploiting reward model bugs)
+- Mode collapse (forgetting how to generate coherent text)
+- Distribution shift (generating text unlike the training distribution)
+
+### The Complete Loss Function
+
+The total PPO loss combines multiple objectives:
+
+$$
+L(\theta) = L^{\text{CLIP}}(\theta) + c_1 L^{V}(\theta) - c_2 H(\theta) + c_3 L^{\text{KL}}(\theta)
+$$
+
+where:
+- $L^{\text{CLIP}}$: Main PPO policy loss
+- $L^{V}$: Value function loss (MSE between predicted and actual returns)
+- $H$: Entropy bonus (encourages exploration)
+- $L^{\text{KL}}$: KL penalty (prevents drift from reference)
+
+Typical coefficients:
+- $c_1 = 0.5$ (value loss)
+- $c_2 = 0.01$ (entropy)
+- $c_3 = 0.1$ (KL penalty)
+
+See [`src/auto_bot_tuner/rlhf/ppo_loss.py`](https://github.com/yourusername/autotune/blob/main/src/auto_bot_tuner/rlhf/ppo_loss.py) for the implementation.
+
+## Advantages vs Returns
+
+A key concept in actor-critic methods is the **advantage function**:
+
+$$
+A(s, a) = Q(s, a) - V(s)
+$$
+
+**Intuition:** "How much better is this action compared to the average action from this state?"
+
+- If $A(s, a) > 0$: This action is better than average → increase its probability
+- If $A(s, a) < 0$: This action is worse than average → decrease its probability
+- If $A(s, a) = 0$: This action is average → no change
+
+**Why not just use rewards?**
+
+Consider two scenarios:
+1. State is terrible, action gets reward = 5
+2. State is great, action gets reward = 5
+
+Same reward, but scenario 1 is a good action (made the best of a bad situation) and scenario 2 is a bad action (wasted a good opportunity).
+
+Advantages capture this context!
+
+### Generalized Advantage Estimation (GAE)
+
+Computing exact advantages requires knowing future rewards, which we don't have. **GAE** efficiently estimates advantages:
+
+$$
+\hat{A}_t = \sum_{l=0}^{\infty} (\gamma \lambda)^l \delta_{t+l}
+$$
+
+where $\delta_t = r_t + \gamma V(s_{t+1}) - V(s_t)$ is the TD error.
+
+Parameters:
+- $\gamma$ (discount factor): How much to value future rewards (typically 0.99)
+- $\lambda$ (GAE lambda): Bias-variance tradeoff (typically 0.95)
+
+**Intuition:** GAE is a weighted combination of n-step advantages, smoothing the estimate.
+
+See [`src/auto_bot_tuner/rlhf/rollout_buffer.py`](https://github.com/yourusername/autotune/blob/main/src/auto_bot_tuner/rlhf/rollout_buffer.py) for the implementation.
+
+## The Rollout Buffer
+
+During training, we store generated trajectories in a **rollout buffer**:
+
+```python
+@dataclass
+class RolloutBatch:
+    """A batch of rollout data for PPO training."""
+
+    # Input data
+    query_tensors: torch.Tensor       # Prompts
+    response_tensors: torch.Tensor    # Generated responses
+
+    # Model outputs during generation
+    logprobs: torch.Tensor            # Log probs of generated tokens
+    values: torch.Tensor              # Value estimates
+
+    # Rewards and advantages
+    rewards: torch.Tensor             # Reward for each response
+    advantages: torch.Tensor          # GAE advantages
+    returns: torch.Tensor             # Discounted returns
+
+    # Masks
+    attention_mask: Optional[torch.Tensor]  # Mask for padding
+```
+
+**Why buffer rollouts?**
+
+1. **Sample efficiency:** Reuse each rollout multiple times (PPO epochs)
+2. **Stable updates:** Update on a batch of diverse experiences
+3. **Advantage computation:** Need full trajectory to compute GAE
+
+## Training Dynamics and Stability
+
+RLHF training is notoriously unstable. Several mechanisms ensure stability:
+
+### 1. Clipped Objective
+
+The PPO clip prevents catastrophic policy updates:
+
+```python
+# Unclipped: ratio * advantage
+# Clipped: clip(ratio, 1-ε, 1+ε) * advantage
+# Take the minimum (conservative update)
+loss = -min(ratio * advantage, clip(ratio, 1-0.2, 1+0.2) * advantage)
+```
+
+### 2. KL Penalty
+
+Prevents drift from reference model:
+
+```python
+kl_penalty = (policy_logprobs - ref_logprobs).mean()
+total_loss += kl_coef * kl_penalty  # kl_coef = 0.1
+```
+
+### 3. Advantage Normalization
+
+Whiten advantages to consistent scale:
+
+```python
+advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+```
+
+### 4. Small Learning Rate
+
+Much lower than SFT (1e-6 vs 3e-4):
+
+```python
+optimizer = AdamW(model.parameters(), lr=1e-6)
+```
+
+### 5. Gradient Clipping
+
+Prevent exploding gradients:
+
+```python
+torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+```
+
+## Common Failure Modes
+
+<Aside type="caution">
+  RLHF is powerful but fragile. Watch out for these failure modes!
+</Aside>
+
+### Reward Hacking
+
+**Problem:** Policy discovers ways to maximize reward that don't align with actual quality.
+
+**Example:** Reward model likes long responses → Policy generates endless repetition
+
+**Solution:**
+- Diverse reward models (ensemble)
+- KL penalty (stay close to reference)
+- Reward model iterative refinement
+
+### Mode Collapse
+
+**Problem:** Policy converges to generating the same response for all prompts.
+
+**Example:** Every prompt gets "I'm sorry, I can't help with that."
+
+**Solution:**
+- Entropy bonus (encourage diversity)
+- KL penalty (preserve variety from SFT)
+- Lower learning rate
+
+### Distribution Shift
+
+**Problem:** Policy generates text unlike anything in training data, breaking the reward model.
+
+**Example:** Policy uses weird tokens/patterns that reward model never saw.
+
+**Solution:**
+- KL penalty (most important!)
+- Reference model checks
+- Training data diversity
+
+### Reward Model Saturation
+
+**Problem:** All responses get similar rewards → no learning signal.
+
+**Example:** Reward model gives everything score ~0.5
+
+**Solution:**
+- Better reward model training
+- More diverse comparison data
+- Reward normalization
+
+## Code Example: Complete RLHF Pipeline
+
+Here's how to run the complete RLHF pipeline:
+
+```python
+from src.auto_bot_tuner.rlhf import (
+    PPOTrainer, PPOConfig, PromptDataset,
+    create_reference_model,
+    create_value_network_from_policy,
+    create_reward_model_from_pretrained
+)
+from src.auto_bot_tuner.utils.model_loading import load_model_and_tokenizer
+
+# 1. Load SFT model (from Stage 1)
+policy_model, tokenizer, device = load_model_and_tokenizer(
+    "path/to/sft_checkpoint",
+    use_lora=True
+)
+
+# 2. Create reference model (frozen copy)
+reference_model = create_reference_model(policy_model)
+
+# 3. Create value network
+value_network = create_value_network_from_policy(policy_model)
+value_network = value_network.to(device)
+
+# 4. Load reward model (from Stage 2)
+reward_model = create_reward_model_from_pretrained(
+    "path/to/reward_model_checkpoint",
+    tokenizer
+)
+reward_model = reward_model.to(device)
+
+# 5. Create prompt dataset
+prompts = [
+    "Explain quantum computing to a 5-year-old",
+    "Write a short poem about AI",
+    "What are the ethical implications of AGI?",
+    # ... more prompts
+]
+prompt_dataset = PromptDataset(prompts, tokenizer)
+
+# 6. Configure PPO
+config = PPOConfig(
+    learning_rate=1e-6,
+    batch_size=4,
+    ppo_epochs=4,
+    num_rollouts=100,
+    clip_ratio=0.2,
+    kl_coef=0.1,
+    gamma=0.99,
+    gae_lambda=0.95
+)
+
+# 7. Create trainer
+trainer = PPOTrainer(
+    policy_model=policy_model,
+    value_network=value_network,
+    reward_model=reward_model,
+    reference_model=reference_model,
+    tokenizer=tokenizer,
+    prompt_dataset=prompt_dataset,
+    config=config
+)
+
+# 8. Train!
+trainer.train()
+```
+
+## Historical Context: InstructGPT
+
+RLHF gained prominence with OpenAI's **InstructGPT** paper (2022), which introduced the three-stage pipeline:
+
+**Key findings:**
+1. 1.3B InstructGPT outperforms 175B GPT-3 on helpfulness (human eval)
+2. RLHF teaches models to be more truthful and less toxic
+3. The method generalizes: works for summarization, QA, chat, etc.
+
+**Why it works:**
+- Human feedback is higher quality than demonstration
+- Comparisons are easier than absolute ratings
+- RL can optimize subtle preferences that SFT misses
+
+## Comparison: RLHF vs DPO
+
+**Direct Preference Optimization (DPO)** is an alternative to RLHF:
+
+| Aspect | RLHF | DPO |
+|--------|------|-----|
+| **Stages** | 3 (SFT → Reward → PPO) | 2 (SFT → DPO) |
+| **Models** | 4 models (policy, value, reward, reference) | 2 models (policy, reference) |
+| **Complexity** | High (RL training loop) | Low (supervised loss) |
+| **Sample efficiency** | Lower (need rollouts) | Higher (direct on preferences) |
+| **Flexibility** | High (can change reward) | Lower (baked into loss) |
+| **Stability** | Moderate (needs tuning) | High (more stable) |
+
+**When to use RLHF:**
+- You have lots of prompts (for rollouts)
+- You need to iterate on reward model
+- You want maximum flexibility
+
+**When to use DPO:**
+- Simpler is better
+- Limited compute
+- Stable training is priority
+
+See the [DPO section](/dpo/) for details.
+
+## Next Steps
+
+Now that you understand the RLHF pipeline, dive deeper:
+
+1. **[PPO Algorithm](/rlhf/ppo/)** - Deep dive into the PPO objective and implementation
+2. **[KL Penalty](/rlhf/kl-penalty/)** - Why KL divergence is critical for stability
+3. **[Training Dynamics](/rlhf/dynamics/)** - Rollout generation, GAE, and the two-phase training
+4. **[Reference Models](/rlhf/reference/)** - Creating and using frozen reference models
+
+Let's start with understanding PPO! 🚀

@@ -1,0 +1,1027 @@
+---
+title: Hyperparameter Tuning
+description: Comprehensive guide to tuning hyperparameters for SFT, DPO, and RLHF
+---
+
+import { Aside, Card, CardGrid, Tabs, TabItem } from '@astrojs/starlight/components';
+
+## Why Hyperparameters Matter
+
+Hyperparameters can make the difference between a model that:
+
+- **Succeeds:** Converges smoothly, achieves strong performance, generalizes well
+- **Fails:** Diverges, gets stuck, overfits, or forgets pre-training knowledge
+
+**Impact on performance:**
+```
+Bad hyperparameters:  Loss: 2.5 → 2.3 → 2.4 → 2.6 → NaN
+Good hyperparameters: Loss: 2.5 → 1.8 → 1.4 → 1.2 → 1.1 ✓
+```
+
+This guide provides **concrete recommendations** for every major hyperparameter across all post-training methods.
+
+## Learning Rate
+
+**The most important hyperparameter.** Too high → instability. Too low → slow convergence.
+
+### Method-Specific Recommendations
+
+<Tabs>
+  <TabItem label="SFT">
+**Supervised Fine-Tuning**
+
+| Setup | Learning Rate | Rationale |
+|-------|--------------|-----------|
+| **Full fine-tuning** | 2e-5 to 5e-5 | Model already trained, small updates needed |
+| **LoRA (r=8-16)** | 1e-4 to 5e-4 | LoRA params randomly initialized, need stronger signal |
+| **LoRA (r=32-64)** | 5e-5 to 2e-4 | Higher capacity, more stable |
+
+**Default recommendation: 3e-4 for LoRA, 3e-5 for full fine-tuning**
+
+**Example from codebase:**
+
+```python
+from src.auto_bot_tuner.sft import SFTConfig, SFTTrainer
+
+# LoRA training
+config = SFTConfig(
+    learning_rate=3e-4,  # 10x higher than full FT
+    batch_size=8,
+    num_epochs=3,
+)
+```
+</TabItem>
+
+  <TabItem label="DPO">
+**Direct Preference Optimization**
+
+| Setup | Learning Rate | Rationale |
+|-------|--------------|-----------|
+| **Full fine-tuning** | 5e-6 to 2e-5 | Very sensitive, small updates to preference signal |
+| **LoRA (r=8-16)** | 5e-5 to 2e-4 | Need stronger updates for randomly initialized LoRA |
+| **LoRA (r=32-64)** | 2e-5 to 1e-4 | Higher rank = more stable |
+
+**Default recommendation: 5e-5 for LoRA, 1e-5 for full fine-tuning**
+
+<Aside type="caution">
+DPO is more sensitive to learning rate than SFT. Start conservative (5e-5) and increase if needed.
+</Aside>
+
+**Why lower than SFT?**
+- Model already instruction-tuned from SFT
+- Preference signal is subtle
+- Risk of forgetting instruction-following capability
+
+**Example:**
+
+```python
+from src.auto_bot_tuner.dpo import DPOConfig, DPOTrainer
+
+config = DPOConfig(
+    learning_rate=5e-5,  # Lower than SFT
+    beta=0.1,            # DPO temperature parameter
+    batch_size=4,
+    num_epochs=1,        # DPO often needs only 1 epoch
+)
+```
+</TabItem>
+
+  <TabItem label="RLHF">
+**Reinforcement Learning from Human Feedback**
+
+| Component | Learning Rate | Rationale |
+|-----------|--------------|-----------|
+| **Policy (full FT)** | 1e-6 to 5e-6 | Extremely sensitive due to RL instability |
+| **Policy (LoRA)** | 1e-5 to 5e-5 | LoRA more stable, can use higher LR |
+| **Value network** | 3e-5 to 1e-4 | Separate network, can train faster |
+| **Reward model** | 3e-5 to 1e-4 | Standard supervised training |
+
+**Default recommendation: 1e-5 for policy (LoRA), 5e-5 for value network**
+
+<Aside type="caution">
+RLHF requires the lowest learning rates. Start at 1e-5 and only increase if training is stable.
+</Aside>
+
+**Why so low?**
+- RL optimization is inherently unstable
+- Policy affects both reward and KL penalty
+- Easy to diverge from reference model
+
+**Example:**
+
+```python
+from src.auto_bot_tuner.rlhf import RLHFConfig, PPOTrainer
+
+config = RLHFConfig(
+    policy_lr=1e-5,      # Very low for stability
+    value_lr=5e-5,       # Can be higher
+    kl_coef=0.1,         # KL divergence coefficient
+    batch_size=4,
+    ppo_epochs=4,
+)
+```
+</TabItem>
+</Tabs>
+
+### Learning Rate Schedules
+
+**Warmup + Cosine Decay (Recommended):**
+
+```python
+from transformers import get_cosine_schedule_with_warmup
+
+# Warmup for 5-10% of training, then cosine decay
+scheduler = get_cosine_schedule_with_warmup(
+    optimizer,
+    num_warmup_steps=100,      # Warmup steps
+    num_training_steps=1000,   # Total steps
+)
+
+# Learning rate schedule:
+# 0 → 100 steps:     Linear warmup (0 → peak_lr)
+# 100 → 1000 steps:  Cosine decay (peak_lr → 0.1 * peak_lr)
+```
+
+**Linear decay:**
+
+```python
+from transformers import get_linear_schedule_with_warmup
+
+scheduler = get_linear_schedule_with_warmup(
+    optimizer,
+    num_warmup_steps=100,
+    num_training_steps=1000,
+)
+
+# Learning rate schedule:
+# 0 → 100 steps:     Linear warmup (0 → peak_lr)
+# 100 → 1000 steps:  Linear decay (peak_lr → 0)
+```
+
+**Constant with warmup:**
+
+```python
+from transformers import get_constant_schedule_with_warmup
+
+scheduler = get_constant_schedule_with_warmup(
+    optimizer,
+    num_warmup_steps=100,
+)
+
+# Learning rate schedule:
+# 0 → 100 steps:     Linear warmup (0 → peak_lr)
+# 100+ steps:        Constant (peak_lr)
+```
+
+### Warmup Steps
+
+**Purpose:** Prevent large gradient updates early in training when model/optimizer states are unstable.
+
+**Recommendations:**
+
+```python
+# Rule of thumb: 5-10% of total training steps
+total_steps = len(dataloader) * num_epochs / gradient_accumulation_steps
+warmup_steps = int(0.05 * total_steps)  # 5% warmup
+
+# Concrete examples:
+# Short training (1000 steps):  warmup = 50-100 steps
+# Medium (10,000 steps):        warmup = 500-1000 steps
+# Long (100,000 steps):         warmup = 2000-5000 steps
+```
+
+**Configuration:**
+
+```python
+config = SFTConfig(
+    learning_rate=3e-4,
+    warmup_steps=100,       # Absolute number
+    # OR
+    warmup_ratio=0.05,      # Fraction of total steps
+)
+```
+
+<Aside type="tip">
+For unstable training, increase warmup to 10-20% of total steps.
+</Aside>
+
+### Finding Your Optimal Learning Rate
+
+**LR Range Test (recommended):**
+
+```python
+def lr_range_test(model, dataloader, min_lr=1e-6, max_lr=1e-3, steps=100):
+    """
+    Run learning rate range test to find optimal LR.
+
+    Tests exponentially increasing learning rates and plots loss.
+    Optimal LR is typically where loss decreases fastest.
+    """
+    lrs = []
+    losses = []
+
+    # Exponentially increase LR
+    lr_mult = (max_lr / min_lr) ** (1 / steps)
+    lr = min_lr
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+
+    for i, batch in enumerate(dataloader):
+        if i >= steps:
+            break
+
+        # Forward pass
+        loss = model(**batch).loss
+
+        # Record
+        lrs.append(lr)
+        losses.append(loss.item())
+
+        # Backward
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        # Increase learning rate
+        lr *= lr_mult
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+
+    # Plot results
+    import matplotlib.pyplot as plt
+    plt.plot(lrs, losses)
+    plt.xscale('log')
+    plt.xlabel('Learning Rate')
+    plt.ylabel('Loss')
+    plt.title('LR Range Test')
+    plt.savefig('lr_range_test.png')
+
+    # Find LR with steepest gradient
+    gradients = np.gradient(losses)
+    best_idx = np.argmin(gradients)
+    optimal_lr = lrs[best_idx]
+
+    print(f"Suggested learning rate: {optimal_lr:.2e}")
+    return optimal_lr
+
+# Run test
+optimal_lr = lr_range_test(model, train_dataloader)
+```
+
+**Grid search (simple but effective):**
+
+```python
+learning_rates = [1e-5, 3e-5, 1e-4, 3e-4, 1e-3]
+
+results = []
+for lr in learning_rates:
+    config = SFTConfig(learning_rate=lr, num_epochs=1)
+    trainer = SFTTrainer(model=model, config=config, ...)
+
+    metrics = trainer.train()
+    results.append({
+        'lr': lr,
+        'final_loss': metrics['train_loss'],
+        'eval_loss': metrics['eval_loss']
+    })
+
+# Print results
+for r in sorted(results, key=lambda x: x['eval_loss']):
+    print(f"LR: {r['lr']:.2e} → Eval loss: {r['eval_loss']:.4f}")
+```
+
+## Batch Size
+
+**Impact on training:**
+- **Larger batches:** More stable gradients, better GPU utilization, faster wall-clock time
+- **Smaller batches:** More noise, better generalization, fits in less memory
+
+### Effective Batch Size
+
+```python
+effective_batch_size = batch_size × gradient_accumulation_steps × num_gpus
+
+# Examples:
+# Single GPU:   batch_size=8,  gradient_accumulation=4 → effective_batch=32
+# 4 GPUs:       batch_size=8,  gradient_accumulation=1 → effective_batch=32
+```
+
+### Method-Specific Recommendations
+
+| Method | Recommended Effective Batch Size | Typical Physical Batch |
+|--------|----------------------------------|----------------------|
+| **SFT** | 32-128 | 8-16 per GPU |
+| **DPO** | 16-64 | 4-8 per GPU |
+| **RLHF** | 16-64 (rollout), 64-256 (PPO) | 4-8 per GPU |
+| **Reward Model** | 32-64 | 8-16 per GPU |
+
+<Aside type="note">
+DPO and RLHF use smaller batches because each sample is effectively 2x the size (chosen + rejected).
+</Aside>
+
+### Batch Size Tuning
+
+**Find maximum batch size:**
+
+```python
+# Start with conservative estimate
+batch_size = 4
+
+while batch_size <= 128:
+    try:
+        config = SFTConfig(batch_size=batch_size)
+        trainer = SFTTrainer(model=model, config=config, ...)
+
+        # Try one training step
+        trainer.train_one_epoch()
+
+        print(f"✓ Batch size {batch_size} works")
+        batch_size *= 2  # Try doubling
+
+    except torch.cuda.OutOfMemoryError:
+        print(f"✗ Batch size {batch_size} OOM")
+        batch_size //= 2  # Use previous size
+        break
+
+optimal_batch_size = batch_size
+```
+
+**Scale learning rate with batch size:**
+
+When increasing batch size, scale learning rate proportionally:
+
+```
+New LR = Base LR × sqrt(New Batch Size / Base Batch Size)
+
+# Examples:
+Base: batch=32, lr=3e-4
+Double batch to 64: lr = 3e-4 × sqrt(64/32) = 3e-4 × 1.41 = 4.24e-4
+```
+
+<Aside type="tip">
+**Linear scaling rule:** LR ∝ batch size (for very large batches)
+**Square root scaling rule:** LR ∝ sqrt(batch size) (more conservative, recommended)
+</Aside>
+
+## Gradient Clipping
+
+**Purpose:** Prevent exploding gradients by clipping gradient norm.
+
+### Recommendations
+
+```python
+config = SFTConfig(
+    max_grad_norm=1.0,  # Default, works for most cases
+)
+
+# Method-specific:
+# SFT:  1.0 (standard)
+# DPO:  0.5-1.0 (more sensitive)
+# RLHF: 0.3-0.5 (very sensitive to gradient spikes)
+```
+
+**How it works:**
+
+```python
+# Gradient clipping in PyTorch
+torch.nn.utils.clip_grad_norm_(
+    model.parameters(),
+    max_norm=1.0
+)
+
+# Effect:
+# If gradient norm > 1.0, scale all gradients by (1.0 / gradient_norm)
+# This preserves gradient direction while limiting magnitude
+```
+
+### Signs You Need Stricter Clipping
+
+```
+Loss jumps suddenly:         2.1 → 2.0 → 5.6 → NaN
+Gradients exploding:         Grad norm: 0.5 → 0.8 → 47.2 → NaN
+Model outputs degenerate:    All responses become identical
+```
+
+**Solution:** Reduce `max_grad_norm` from 1.0 → 0.5 → 0.3
+
+## Weight Decay
+
+**Purpose:** L2 regularization to prevent overfitting.
+
+### Recommendations
+
+```python
+# Standard weight decay values
+config = SFTConfig(
+    weight_decay=0.01,  # Default for SFT
+)
+
+# Method-specific:
+# SFT:           0.01 (standard)
+# DPO:           0.001-0.01 (lighter regularization)
+# RLHF:          0.01 (standard)
+# LoRA:          0.01-0.1 (can use heavier, fewer params)
+```
+
+**Effect on training:**
+
+```
+weight_decay=0.0:    Fast initial convergence, may overfit
+weight_decay=0.01:   Balanced (recommended)
+weight_decay=0.1:    Slower convergence, better generalization
+weight_decay=0.5:    Too strong, may underfit
+```
+
+### When to Adjust
+
+**Increase weight decay (0.01 → 0.1) if:**
+- Training loss ≪ validation loss (overfitting)
+- Model memorizing training data
+- Small dataset (&lt;10k examples)
+
+**Decrease weight decay (0.01 → 0.001) if:**
+- Training loss not decreasing
+- Large dataset (>100k examples)
+- Already using dropout or other regularization
+
+## Method-Specific Hyperparameters
+
+### DPO: Beta (Temperature)
+
+**The key DPO hyperparameter.** Controls how strongly the model deviates from reference model.
+
+**Formula:**
+
+$$
+\mathcal{L}_{\text{DPO}} = -\log \sigma\left(\beta \left[\log \frac{\pi_\theta(y_w|x)}{\pi_{\text{ref}}(y_w|x)} - \log \frac{\pi_\theta(y_l|x)}{\pi_{\text{ref}}(y_l|x)}\right]\right)
+$$
+
+**Effect:**
+
+```python
+beta=0.01:  Very weak preference signal, model changes little
+beta=0.1:   Standard (recommended)
+beta=0.3:   Strong preference signal
+beta=1.0:   Very strong, may overfit to preferences
+```
+
+**Recommendations:**
+
+| Dataset Quality | Beta Value | Rationale |
+|----------------|-----------|-----------|
+| **High quality** (human annotated) | 0.1-0.3 | Trust preferences, optimize strongly |
+| **Medium quality** (AI labeled) | 0.05-0.1 | Some noise, be conservative |
+| **Low quality** (heuristic) | 0.01-0.05 | Very noisy, weak optimization |
+
+**Example:**
+
+```python
+from src.auto_bot_tuner.dpo import DPOConfig
+
+config = DPOConfig(
+    learning_rate=5e-5,
+    beta=0.1,          # Standard DPO temperature
+    batch_size=4,
+    num_epochs=1,
+)
+```
+
+**Tuning beta:**
+
+```python
+betas = [0.01, 0.05, 0.1, 0.3, 0.5]
+
+for beta in betas:
+    config = DPOConfig(beta=beta, learning_rate=5e-5)
+    trainer = DPOTrainer(model=model, config=config, ...)
+
+    metrics = trainer.train()
+
+    print(f"Beta: {beta:.2f}")
+    print(f"  DPO Loss: {metrics['dpo_loss']:.4f}")
+    print(f"  Accuracy: {metrics['accuracy']:.2%}")  # Chosen > rejected
+    print(f"  Reward margin: {metrics['reward_margin']:.4f}")
+```
+
+<Aside type="tip">
+Start with beta=0.1. Increase if model not learning preferences, decrease if overfitting.
+</Aside>
+
+### RLHF: KL Coefficient
+
+**Controls how much the policy can deviate from reference model.**
+
+**Formula:**
+
+$$
+\mathcal{L}_{\text{RLHF}} = \mathbb{E}\left[r(x,y) - \lambda_{\text{KL}} \cdot \text{KL}(\pi_\theta || \pi_{\text{ref}})\right]
+$$
+
+**Effect:**
+
+```python
+kl_coef=0.01:  Policy can deviate significantly, may mode collapse
+kl_coef=0.1:   Balanced (recommended)
+kl_coef=0.5:   Strong constraint, limited deviation
+kl_coef=2.0:   Very constrained, minimal change
+```
+
+**Recommendations:**
+
+| Scenario | KL Coefficient | Rationale |
+|----------|---------------|-----------|
+| **Early training** | 0.05-0.1 | Allow exploration |
+| **Late training** | 0.1-0.3 | Maintain stability |
+| **Unstable training** | 0.3-1.0 | Strong constraint |
+| **With reward hacking** | 0.5-2.0 | Prevent exploitation |
+
+**Example:**
+
+```python
+from src.auto_bot_tuner.rlhf import RLHFConfig
+
+config = RLHFConfig(
+    policy_lr=1e-5,
+    value_lr=5e-5,
+    kl_coef=0.1,       # KL divergence coefficient
+    batch_size=4,
+    ppo_epochs=4,
+)
+```
+
+**Adaptive KL coefficient:**
+
+```python
+# Start with low KL, increase if KL divergence too high
+initial_kl_coef = 0.05
+target_kl = 0.01  # Target KL divergence
+
+def adjust_kl_coef(current_kl, kl_coef, target_kl):
+    if current_kl > 2 * target_kl:
+        # KL too high, increase coefficient
+        return kl_coef * 1.5
+    elif current_kl < 0.5 * target_kl:
+        # KL too low, decrease coefficient
+        return kl_coef / 1.5
+    else:
+        # KL in acceptable range
+        return kl_coef
+
+# During training:
+current_kl = compute_kl_divergence(policy, reference)
+kl_coef = adjust_kl_coef(current_kl, kl_coef, target_kl)
+```
+
+### RLHF: PPO Hyperparameters
+
+**Clip epsilon:**
+
+```python
+# PPO clips probability ratios to prevent large policy updates
+clip_epsilon = 0.2  # Standard value
+
+# Effect:
+# 0.1: Very conservative updates, slow learning
+# 0.2: Balanced (recommended)
+# 0.3: Aggressive updates, may be unstable
+```
+
+**PPO epochs:**
+
+```python
+# Number of times to iterate over rollout buffer
+ppo_epochs = 4  # Standard value
+
+# Effect:
+# 1-2: Fast but less sample efficient
+# 4:   Balanced (recommended)
+# 8+:  More sample efficient but slower, risk overfitting
+```
+
+**Example configuration:**
+
+```python
+config = RLHFConfig(
+    policy_lr=1e-5,
+    value_lr=5e-5,
+    kl_coef=0.1,
+    clip_epsilon=0.2,      # PPO clipping
+    ppo_epochs=4,          # Optimization epochs per rollout
+    batch_size=4,
+    rollout_batch_size=16, # Samples per rollout
+)
+```
+
+### LoRA: Rank and Alpha
+
+**Rank (r):** Dimensionality of low-rank decomposition.
+
+**Alpha:** Scaling factor for LoRA updates.
+
+**Recommendations:**
+
+| Model Size | Task Complexity | Rank | Alpha | Rationale |
+|-----------|----------------|------|-------|-----------|
+| &lt;1B | Simple (classification) | 4-8 | 8-16 | Minimal capacity needed |
+| &lt;1B | Complex (instruction) | 8-16 | 16-32 | Standard setup |
+| 1B-7B | Simple | 8-16 | 16-32 | Standard setup |
+| 1B-7B | Complex | 16-32 | 32-64 | More capacity |
+| 7B+ | Complex | 32-64 | 64-128 | High capacity |
+
+**Standard relationship:** `alpha = 2 * r`
+
+**From our codebase:**
+
+```python
+from peft import LoraConfig, get_peft_model
+
+lora_config = LoraConfig(
+    r=16,                    # Rank
+    lora_alpha=32,           # Alpha (2 × rank)
+    target_modules=["c_attn", "c_proj"],  # GPT-2
+    lora_dropout=0.05,       # Regularization
+    bias="none",
+    task_type=TaskType.CAUSAL_LM,
+)
+
+model = get_peft_model(model, lora_config)
+```
+
+**Effect of rank:**
+
+```
+r=4:   ~0.1% trainable params, may underfit
+r=8:   ~0.2% trainable params, good for simple tasks
+r=16:  ~0.4% trainable params, standard choice
+r=32:  ~0.8% trainable params, complex tasks
+r=64:  ~1.6% trainable params, very complex or full capacity needed
+```
+
+**Tuning strategy:**
+
+```python
+# Start with r=16
+# If validation loss plateaus → increase rank
+# If overfitting → decrease rank
+
+ranks = [8, 16, 32, 64]
+
+for r in ranks:
+    lora_config = LoraConfig(r=r, lora_alpha=2*r, ...)
+    model = get_peft_model(base_model, lora_config)
+
+    trainer = SFTTrainer(model=model, ...)
+    metrics = trainer.train()
+
+    print(f"Rank {r}: Loss {metrics['eval_loss']:.4f}")
+```
+
+## Number of Epochs
+
+**How many times to iterate over the dataset.**
+
+### Recommendations
+
+| Method | Typical Epochs | Rationale |
+|--------|---------------|-----------|
+| **SFT** | 3-5 | Balance learning and overfitting |
+| **SFT (large dataset)** | 1-2 | >100k examples, one pass often enough |
+| **DPO** | 1-2 | Model already trained, subtle adjustments |
+| **RLHF** | Variable | Based on rollout budget, not epochs |
+| **Reward Model** | 2-4 | Similar to SFT |
+
+**LoRA vs full fine-tuning:**
+
+```python
+# LoRA: Can train longer (less overfitting risk)
+config_lora = SFTConfig(num_epochs=5)
+
+# Full FT: Train shorter (more overfitting risk)
+config_full = SFTConfig(num_epochs=2)
+```
+
+**Early stopping:**
+
+```python
+from src.auto_bot_tuner.sft import SFTConfig
+
+config = SFTConfig(
+    num_epochs=10,              # Maximum epochs
+    eval_steps=100,             # Evaluate every 100 steps
+    save_strategy="steps",
+    load_best_model_at_end=True,  # Load best checkpoint
+    metric_for_best_model="eval_loss",
+    greater_is_better=False,
+)
+
+# Training will use best checkpoint (may be from epoch 3, not 10)
+```
+
+## Systematic Tuning Strategy
+
+### Phase 1: Baseline (1 hour)
+
+**Goal:** Get a working baseline quickly.
+
+```python
+# Use recommended defaults
+config = SFTConfig(
+    learning_rate=3e-4,        # Standard for LoRA
+    batch_size=8,
+    gradient_accumulation_steps=4,
+    num_epochs=3,
+    warmup_steps=100,
+    max_grad_norm=1.0,
+    weight_decay=0.01,
+)
+
+trainer = SFTTrainer(model=model, config=config, ...)
+baseline_metrics = trainer.train()
+
+print(f"Baseline loss: {baseline_metrics['eval_loss']:.4f}")
+```
+
+### Phase 2: Learning Rate (2-4 hours)
+
+**Goal:** Find optimal learning rate (biggest impact).
+
+```python
+# Test 5 learning rates
+learning_rates = [1e-4, 3e-4, 5e-4, 1e-3, 3e-3]
+
+results = []
+for lr in learning_rates:
+    config = SFTConfig(learning_rate=lr, num_epochs=1)
+    trainer = SFTTrainer(model=model, config=config, ...)
+    metrics = trainer.train()
+
+    results.append({'lr': lr, 'loss': metrics['eval_loss']})
+
+# Pick best LR
+best_lr = min(results, key=lambda x: x['loss'])['lr']
+print(f"Best LR: {best_lr:.2e}")
+```
+
+### Phase 3: Batch Size (1 hour)
+
+**Goal:** Maximize batch size for stability.
+
+```python
+# Find maximum batch size
+batch_sizes = [4, 8, 16, 32]
+
+for bs in batch_sizes:
+    try:
+        config = SFTConfig(
+            learning_rate=best_lr,
+            batch_size=bs,
+            num_epochs=0.1,  # Quick test
+        )
+        trainer = SFTTrainer(model=model, config=config, ...)
+        trainer.train()
+
+        print(f"✓ Batch size {bs} fits")
+        best_batch_size = bs
+
+    except torch.cuda.OutOfMemoryError:
+        print(f"✗ Batch size {bs} OOM")
+        break
+```
+
+### Phase 4: Method-Specific (2-4 hours)
+
+**DPO: Tune beta**
+
+```python
+betas = [0.05, 0.1, 0.2, 0.3]
+
+for beta in betas:
+    config = DPOConfig(learning_rate=best_lr, beta=beta)
+    trainer = DPOTrainer(model=model, config=config, ...)
+    metrics = trainer.train()
+
+    print(f"Beta {beta}: Accuracy {metrics['accuracy']:.2%}")
+```
+
+**RLHF: Tune KL coefficient**
+
+```python
+kl_coefs = [0.05, 0.1, 0.2, 0.5]
+
+for kl in kl_coefs:
+    config = RLHFConfig(policy_lr=best_lr, kl_coef=kl)
+    trainer = PPOTrainer(model=model, config=config, ...)
+    metrics = trainer.train()
+
+    print(f"KL coef {kl}: Reward {metrics['mean_reward']:.2f}")
+```
+
+### Phase 5: Fine-Tuning (optional, 2-4 hours)
+
+**Tune secondary hyperparameters:**
+
+```python
+# Try different warmup ratios
+warmup_ratios = [0.03, 0.05, 0.1]
+
+# Try different weight decay
+weight_decays = [0.001, 0.01, 0.1]
+
+# Try different gradient clipping
+max_grad_norms = [0.5, 1.0, 2.0]
+
+# Grid search over combinations
+for warmup in warmup_ratios:
+    for wd in weight_decays:
+        for clip in max_grad_norms:
+            config = SFTConfig(
+                learning_rate=best_lr,
+                batch_size=best_batch_size,
+                warmup_ratio=warmup,
+                weight_decay=wd,
+                max_grad_norm=clip,
+            )
+            # Train and evaluate...
+```
+
+## Hyperparameter Cheat Sheet
+
+### SFT (Supervised Fine-Tuning)
+
+```python
+# Recommended configuration (LoRA)
+SFTConfig(
+    learning_rate=3e-4,              # Key parameter
+    batch_size=8,                    # Fit to memory
+    gradient_accumulation_steps=4,   # Effective batch = 32
+    num_epochs=3,                    # 3-5 for most datasets
+    warmup_steps=100,                # 5-10% of training
+    max_grad_norm=1.0,               # Standard clipping
+    weight_decay=0.01,               # Standard regularization
+    lr_scheduler_type="cosine",      # Cosine decay
+)
+```
+
+### DPO (Direct Preference Optimization)
+
+```python
+# Recommended configuration (LoRA)
+DPOConfig(
+    learning_rate=5e-5,              # Lower than SFT!
+    beta=0.1,                        # DPO temperature
+    batch_size=4,                    # Smaller (chosen+rejected)
+    gradient_accumulation_steps=8,   # Effective batch = 32
+    num_epochs=1,                    # Often sufficient
+    warmup_steps=50,                 # Short warmup
+    max_grad_norm=1.0,
+    weight_decay=0.01,
+)
+```
+
+### RLHF (PPO)
+
+```python
+# Recommended configuration (LoRA)
+RLHFConfig(
+    policy_lr=1e-5,                  # Very low for stability
+    value_lr=5e-5,                   # Can be higher
+    kl_coef=0.1,                     # KL penalty strength
+    clip_epsilon=0.2,                # PPO clipping
+    ppo_epochs=4,                    # Optimization epochs
+    batch_size=4,                    # Small batches
+    rollout_batch_size=16,           # Rollout size
+    max_grad_norm=0.5,               # Stricter clipping
+)
+```
+
+### Reward Model Training
+
+```python
+# Recommended configuration
+RewardModelConfig(
+    learning_rate=3e-5,              # Similar to SFT
+    batch_size=8,
+    gradient_accumulation_steps=4,
+    num_epochs=3,
+    warmup_steps=100,
+    max_grad_norm=1.0,
+    weight_decay=0.01,
+)
+```
+
+## Common Hyperparameter Mistakes
+
+### Mistake 1: Using Same LR for All Methods
+
+```python
+# Bad: Same LR everywhere
+sft_config = SFTConfig(learning_rate=3e-4)      # OK
+dpo_config = DPOConfig(learning_rate=3e-4)      # Too high!
+rlhf_config = RLHFConfig(policy_lr=3e-4)        # Way too high!
+
+# Good: Method-specific LRs
+sft_config = SFTConfig(learning_rate=3e-4)      # ✓
+dpo_config = DPOConfig(learning_rate=5e-5)      # ✓
+rlhf_config = RLHFConfig(policy_lr=1e-5)        # ✓
+```
+
+### Mistake 2: Not Scaling LR for LoRA
+
+```python
+# Bad: Using full fine-tuning LR with LoRA
+config = SFTConfig(learning_rate=3e-5)  # Too low for LoRA!
+
+# Good: Higher LR for LoRA
+config = SFTConfig(learning_rate=3e-4)  # 10x higher ✓
+```
+
+### Mistake 3: Ignoring Effective Batch Size
+
+```python
+# Bad: Thinking batch_size=4 is too small
+config = DPOConfig(batch_size=4)  # Seems small...
+
+# Good: Considering effective batch size
+config = DPOConfig(
+    batch_size=4,
+    gradient_accumulation_steps=16,  # Effective = 64 ✓
+)
+```
+
+### Mistake 4: No Warmup
+
+```python
+# Bad: No warmup (unstable start)
+config = SFTConfig(warmup_steps=0)
+
+# Good: 5-10% warmup
+config = SFTConfig(warmup_steps=100)  # Or warmup_ratio=0.05
+```
+
+### Mistake 5: Wrong Beta for DPO
+
+```python
+# Bad: Beta=1.0 (overfitting to noisy preferences)
+dpo_config = DPOConfig(beta=1.0)
+
+# Good: Beta=0.1 for most cases
+dpo_config = DPOConfig(beta=0.1)
+```
+
+## Monitoring Training
+
+**Key metrics to watch:**
+
+```python
+# Training metrics
+- Training loss:          Should decrease steadily
+- Gradient norm:          Should be &lt;1.0 after clipping
+- Learning rate:          Check warmup and decay
+
+# Validation metrics
+- Validation loss:        Should decrease (may lag training)
+- Perplexity:            exp(loss), should decrease
+- Train/val gap:         Should be small (&lt;0.5)
+
+# Method-specific
+- DPO accuracy:          Chosen > rejected, should be >60%
+- DPO reward margin:     Should be positive and increasing
+- RLHF reward:           Should increase
+- RLHF KL divergence:    Should stay low (&lt;0.1)
+```
+
+**Warning signs:**
+
+```
+Loss = NaN:                  LR too high, gradient explosion
+Loss increases:              LR too high or poor hyperparameters
+Loss plateaus:               LR too low or insufficient capacity
+Train ≪ val loss:            Overfitting (regularize more)
+KL divergence spiking:       KL coefficient too low (RLHF)
+Reward hacking:              Reward model issues (RLHF)
+```
+
+## Summary
+
+**Quick Start Hyperparameters:**
+
+| Method | LR | Batch | Beta/KL | Epochs |
+|--------|-----|-------|---------|--------|
+| SFT (LoRA) | 3e-4 | 8×4 | - | 3 |
+| DPO (LoRA) | 5e-5 | 4×8 | β=0.1 | 1 |
+| RLHF (LoRA) | 1e-5 | 4 | KL=0.1 | - |
+
+**Tuning Priority:**
+1. **Learning rate** (biggest impact)
+2. **Batch size** (stability and speed)
+3. **Method-specific** (beta, KL coefficient)
+4. **Secondary** (warmup, weight decay, clipping)
+
+**Remember:**
+- Start with recommendations
+- Use LR range test for new setups
+- Monitor train/val loss carefully
+- Different methods need different hyperparameters
+- LoRA allows more aggressive hyperparameters than full fine-tuning
+
+With proper hyperparameter tuning, you can achieve 90-95% of optimal performance!

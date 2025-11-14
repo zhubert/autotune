@@ -1,0 +1,23 @@
+# Standard DPO Training Configuration
+# For aligning models with human preferences
+
+model:
+  name: "checkpoints/sft/final"  # Use your SFT checkpoint
+  use_lora: true
+
+dataset:
+  name: "Anthropic/hh-rlhf"
+  max_samples: 1000
+  max_length: 512
+
+training:
+  beta: 0.1  # KL penalty strength
+  learning_rate: 5e-7
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  num_epochs: 1
+  warmup_steps: 100
+  logging_steps: 10
+  save_steps: 500
+  bf16: true
+  output_dir: "checkpoints/dpo/standard"

@@ -1,0 +1,998 @@
+---
+title: RLHF Training Dynamics
+description: Understanding rollout generation, advantage estimation, and the two-phase training process
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+## The Two-Phase Training Process
+
+RLHF with PPO alternates between two distinct phases:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     PHASE 1: ROLLOUT                         │
+│                                                              │
+│  Goal: Generate and evaluate trajectories                   │
+│                                                              │
+│  1. Sample prompts from dataset                             │
+│  2. Generate responses with policy model                    │
+│  3. Score responses with reward model                       │
+│  4. Estimate values with value network                      │
+│  5. Compute advantages using GAE                            │
+│  6. Store in rollout buffer                                 │
+│                                                              │
+│  Models used:                                               │
+│    - Policy (inference only)                                │
+│    - Value Network (inference only)                         │
+│    - Reward Model (inference only)                          │
+│    - Reference Model (inference only)                       │
+│                                                              │
+│  ⚠️ NO GRADIENT UPDATES IN THIS PHASE                       │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                     PHASE 2: UPDATE                          │
+│                                                              │
+│  Goal: Improve policy and value network                     │
+│                                                              │
+│  For each PPO epoch (typically 3-5):                        │
+│    1. Sample batch from rollout buffer                      │
+│    2. Forward pass through policy and value network         │
+│    3. Compute PPO loss (with KL penalty)                    │
+│    4. Compute value loss                                    │
+│    5. Backpropagate and update parameters                   │
+│                                                              │
+│  Models used:                                               │
+│    - Policy (training)                                      │
+│    - Value Network (training)                               │
+│    - Reference Model (inference only)                       │
+│                                                              │
+│  ✅ GRADIENTS COMPUTED AND APPLIED                          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+<Aside type="note">
+  This two-phase structure is fundamental to on-policy RL algorithms like PPO. The separation allows us to efficiently reuse collected data while maintaining stability.
+</Aside>
+
+## Phase 1: Rollout Generation
+
+### Step 1: Sampling Prompts
+
+```python
+# From prompt dataset
+prompts = [
+    "Explain quantum computing to a 5-year-old",
+    "Write a haiku about autumn",
+    "What are the causes of climate change?",
+    # ... batch of prompts
+]
+
+# Tokenize
+prompt_encodings = tokenizer(
+    prompts,
+    return_tensors="pt",
+    padding=True,
+    truncation=True,
+    max_length=512
+)
+
+# Shape: (batch_size, prompt_len)
+prompt_ids = prompt_encodings["input_ids"].to(device)
+prompt_mask = prompt_encodings["attention_mask"].to(device)
+```
+
+**Key considerations:**
+- Diverse prompts prevent overfitting to specific patterns
+- Prompt length affects generation length budget
+- Batching improves efficiency but requires padding
+
+### Step 2: Generating Responses
+
+From [`src/auto_bot_tuner/rlhf/ppo_trainer.py`](https://github.com/yourusername/autotune/blob/main/src/auto_bot_tuner/rlhf/ppo_trainer.py):
+
+```python
+@torch.no_grad()  # No gradients during rollout!
+def generate_rollout(self, prompt_batch: dict) -> dict:
+    """Generate responses and collect rollout data."""
+
+    self.policy_model.eval()  # Set to eval mode
+    self.value_network.eval()
+
+    # Generate responses with sampling
+    outputs = self.policy_model.generate(
+        input_ids=prompt_ids,
+        attention_mask=prompt_mask,
+        max_new_tokens=self.config.max_new_tokens,  # e.g., 128
+        do_sample=True,                             # Sampling, not greedy
+        temperature=self.config.temperature,        # e.g., 1.0
+        top_p=self.config.top_p,                    # e.g., 0.9
+        top_k=self.config.top_k,                    # e.g., 50
+        pad_token_id=self.tokenizer.pad_token_id,
+        return_dict_in_generate=True,
+    )
+
+    # Extract generated sequences
+    # Shape: (batch_size, prompt_len + response_len)
+    generated_ids = outputs.sequences
+```
+
+**Generation parameters:**
+
+| Parameter | Value | Effect |
+|-----------|-------|--------|
+| **temperature** | 1.0 | Controls randomness (lower = more deterministic) |
+| **top_p** | 0.9 | Nucleus sampling (sample from top 90% probability mass) |
+| **top_k** | 50 | Sample from top 50 tokens only |
+| **do_sample** | True | Use sampling (not greedy decoding) |
+
+**Why sampling, not greedy?**
+- RL needs exploration to discover better solutions
+- Greedy decoding always produces same response
+- Diversity in rollouts improves learning
+
+### Step 3: Computing Log Probabilities
+
+After generation, we need log probabilities for the generated tokens:
+
+```python
+# Split into prompt and response
+prompt_len = prompt_ids.shape[1]
+response_ids = generated_ids[:, prompt_len:]
+
+# Forward pass to get logits
+# (We need probabilities for the tokens we actually generated)
+policy_outputs = self.policy_model(
+    input_ids=generated_ids,
+    attention_mask=(generated_ids != self.tokenizer.pad_token_id).long(),
+    return_dict=True
+)
+
+# Get logits for response tokens
+# Shift for next-token prediction
+response_logits = policy_outputs.logits[:, prompt_len - 1:-1, :]
+
+# Convert to log probabilities
+response_logprobs = F.log_softmax(response_logits, dim=-1)
+
+# Gather log probs for actual generated tokens
+# Shape: (batch_size, response_len)
+policy_logprobs = torch.gather(
+    response_logprobs,
+    dim=-1,
+    index=response_ids.unsqueeze(-1)
+).squeeze(-1)
+```
+
+**Why gather?**
+
+The model outputs probability distribution over **entire vocabulary** (50,257 tokens for GPT-2), but we only care about probability of the **specific token we generated**.
+
+```
+Before gather:
+  response_logprobs: (batch_size, response_len, vocab_size)
+  e.g., [[[0.1, 0.3, 0.05, ...], [0.2, 0.1, 0.4, ...], ...]]
+
+After gather:
+  policy_logprobs: (batch_size, response_len)
+  e.g., [[0.3, 0.4, ...]]  # Just the selected tokens
+```
+
+### Step 4: Getting Reference Log Probabilities
+
+```python
+# Forward pass through reference model (frozen)
+ref_outputs = self.reference_model(
+    input_ids=generated_ids,
+    attention_mask=(generated_ids != self.tokenizer.pad_token_id).long(),
+    return_dict=True
+)
+
+ref_logits = ref_outputs.logits[:, prompt_len - 1:-1, :]
+ref_logprobs_all = F.log_softmax(ref_logits, dim=-1)
+
+# Gather log probs for generated tokens
+ref_logprobs = torch.gather(
+    ref_logprobs_all,
+    dim=-1,
+    index=response_ids.unsqueeze(-1)
+).squeeze(-1)
+```
+
+**Key point:** We use the same generated tokens, but get probabilities under reference model. This allows computing KL divergence.
+
+### Step 5: Getting Value Estimates
+
+```python
+# Forward pass through value network
+value_outputs = self.value_network(
+    input_ids=generated_ids,
+    attention_mask=(generated_ids != self.tokenizer.pad_token_id).long(),
+    return_dict=True
+)
+
+# Extract values for response tokens
+# Shape: (batch_size, response_len)
+values = value_outputs["values"][:, prompt_len:]
+```
+
+The value network outputs a value estimate for **each token position**, predicting expected future reward.
+
+### Step 6: Scoring with Reward Model
+
+```python
+# Forward pass through reward model
+reward_outputs = self.reward_model(
+    input_ids=generated_ids,
+    attention_mask=(generated_ids != self.tokenizer.pad_token_id).long(),
+    return_dict=True
+)
+
+# Get scalar reward for each sequence
+# Shape: (batch_size,)
+rewards = reward_outputs["rewards"]
+```
+
+**Key difference from other models:** Reward model outputs **single scalar per sequence**, not per-token predictions.
+
+### Step 7: Storing in Rollout Buffer
+
+```python
+# Create rollout data dictionary
+rollout_data = {
+    "queries": prompt_ids,
+    "responses": response_ids,
+    "policy_logprobs": policy_logprobs,
+    "ref_logprobs": ref_logprobs,
+    "values": values,
+    "rewards": rewards,
+    "masks": (response_ids != self.tokenizer.pad_token_id).float(),
+    "logits": response_logits  # For entropy computation
+}
+
+return rollout_data
+```
+
+This data will be used in Phase 2 for computing losses and updates.
+
+## Advantage Estimation with GAE
+
+After collecting rollouts, we need to compute **advantages**: how much better was each action compared to expected?
+
+### The Advantage Function
+
+$$
+A^{\pi}(s_t, a_t) = Q^{\pi}(s_t, a_t) - V^{\pi}(s_t)
+$$
+
+where:
+- $Q^{\pi}(s_t, a_t)$ is the expected return starting from state $s_t$, taking action $a_t$
+- $V^{\pi}(s_t)$ is the expected return starting from state $s_t$ under policy $\pi$
+
+**Intuition:** "How much better is this action compared to the average action from this state?"
+
+### The Problem with Monte Carlo Estimation
+
+The simplest approach: use actual return as estimate of $Q$:
+
+$$
+\hat{A}_t = \left(\sum_{k=t}^{T} \gamma^{k-t} r_k\right) - V(s_t)
+$$
+
+**Problems:**
+- **High variance:** Returns depend on all future actions (noisy!)
+- **Slow learning:** Must wait until end of episode
+- **Credit assignment:** Hard to know which actions caused which rewards
+
+### Temporal Difference (TD) Estimation
+
+Use value function to bootstrap:
+
+$$
+\hat{A}_t = r_t + \gamma V(s_{t+1}) - V(s_t)
+$$
+
+This is called **TD error** or **1-step advantage**.
+
+**Advantages:**
+- **Lower variance:** Only depends on one step
+- **Faster learning:** Don't need complete trajectory
+- **Better credit assignment:** Immediate feedback
+
+**Disadvantage:**
+- **Biased:** Relies on value function estimate (which may be wrong)
+
+### Generalized Advantage Estimation (GAE)
+
+GAE balances bias and variance by combining n-step advantages:
+
+$$
+\hat{A}_t^{\text{GAE}} = \sum_{l=0}^{\infty} (\gamma \lambda)^l \delta_{t+l}
+$$
+
+where $\delta_t = r_t + \gamma V(s_{t+1}) - V(s_t)$ is the TD error.
+
+**Key parameter: λ (lambda)**
+- $\lambda = 0$: Pure TD (low variance, high bias)
+- $\lambda = 1$: Pure Monte Carlo (high variance, low bias)
+- $\lambda = 0.95$: Balanced (typical choice)
+
+From [`src/auto_bot_tuner/rlhf/rollout_buffer.py`](https://github.com/yourusername/autotune/blob/main/src/auto_bot_tuner/rlhf/rollout_buffer.py):
+
+```python
+def compute_gae(
+    rewards: torch.Tensor,       # (seq_len,) or (batch_size, seq_len)
+    values: torch.Tensor,        # (seq_len,) or (batch_size, seq_len)
+    gamma: float = 0.99,         # Discount factor
+    lam: float = 0.95,           # GAE lambda
+    mask: Optional[torch.Tensor] = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute Generalized Advantage Estimation (GAE).
+
+    GAE computes advantages as:
+    A_t = δ_t + (γλ)δ_{t+1} + (γλ)²δ_{t+2} + ...
+
+    where δ_t = r_t + γV(s_{t+1}) - V(s_t) is the TD error
+    """
+    batch_size, seq_len = rewards.shape
+
+    advantages = torch.zeros_like(rewards)
+    returns = torch.zeros_like(rewards)
+
+    # Compute advantages backward through time
+    gae = 0
+    for t in reversed(range(seq_len)):
+        if t == seq_len - 1:
+            next_value = 0  # Terminal state
+        else:
+            next_value = values[:, t + 1]
+
+        # TD error: δ_t = r_t + γV(s_{t+1}) - V(s_t)
+        delta = rewards[:, t] + gamma * next_value - values[:, t]
+
+        # GAE: A_t = δ_t + (γλ)A_{t+1}
+        gae = delta + gamma * lam * gae
+        advantages[:, t] = gae
+
+        # Returns: R_t = A_t + V(s_t)
+        returns[:, t] = advantages[:, t] + values[:, t]
+
+        # Apply mask if provided
+        if mask is not None:
+            advantages[:, t] *= mask[:, t]
+            returns[:, t] *= mask[:, t]
+
+    return advantages, returns
+```
+
+### Understanding the Recursion
+
+The key insight is the recursive formulation:
+
+$$
+\begin{align}
+\hat{A}_t &= \delta_t + \gamma\lambda \delta_{t+1} + (\gamma\lambda)^2 \delta_{t+2} + \ldots \\
+&= \delta_t + \gamma\lambda \hat{A}_{t+1}
+\end{align}
+$$
+
+This allows efficient computation in a single backward pass!
+
+### Rewards in Language Modeling
+
+In language modeling, we typically get a **single reward at the end**:
+
+```python
+# Reward sequence: 0, 0, ..., 0, R
+reward_sequence = torch.zeros_like(values)
+reward_sequence[:, -1] = rewards  # R only at last token
+```
+
+**Why?** The reward model scores the **complete response**, not individual tokens.
+
+**Implications:**
+- Early tokens get credit via GAE propagation
+- Value function learns which prefixes lead to high rewards
+- Advantage estimates smooth credit across sequence
+
+### Advantage Normalization (Whitening)
+
+After computing advantages, we normalize them:
+
+```python
+def whiten_advantages(
+    advantages: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+    eps: float = 1e-8
+) -> torch.Tensor:
+    """
+    Normalize advantages to mean 0, std 1.
+
+    This stabilizes training by ensuring advantages are on a consistent scale.
+    """
+    if mask is not None:
+        # Compute stats over valid positions only
+        masked_advantages = advantages * mask
+        sum_advantages = masked_advantages.sum()
+        count = mask.sum()
+        mean = sum_advantages / (count + eps)
+
+        variance = ((masked_advantages - mean * mask) ** 2 * mask).sum() / (count + eps)
+        std = torch.sqrt(variance + eps)
+    else:
+        mean = advantages.mean()
+        std = advantages.std() + eps
+
+    normalized = (advantages - mean) / std
+
+    if mask is not None:
+        normalized = normalized * mask
+
+    return normalized
+```
+
+**Why normalize?**
+- Advantages can have very different scales across batches
+- Normalization makes learning rate more stable
+- PPO objective becomes scale-invariant
+
+**When applied:**
+```python
+# After computing GAE
+advantages, returns = compute_gae(rewards, values, gamma=0.99, lam=0.95)
+
+# Normalize
+if config.whiten_advantages:
+    advantages = whiten_advantages(advantages, mask=response_mask)
+```
+
+## The Value Network
+
+The value network is crucial for computing good advantage estimates.
+
+### Architecture
+
+From [`src/auto_bot_tuner/rlhf/value_network.py`](https://github.com/yourusername/autotune/blob/main/src/auto_bot_tuner/rlhf/value_network.py):
+
+```python
+class ValueNetwork(nn.Module):
+    """
+    Value network that estimates state values for PPO.
+
+    Similar architecture to the policy model, but with a scalar output head
+    instead of vocabulary head.
+    """
+
+    def __init__(self, base_model: PreTrainedModel, freeze_base: bool = False):
+        super().__init__()
+
+        self.base_model = base_model
+
+        # Freeze base if requested (faster, but less expressive)
+        if freeze_base:
+            for param in self.base_model.parameters():
+                param.requires_grad = False
+
+        # Value head: hidden_size → 1
+        self.value_head = nn.Sequential(
+            nn.Dropout(0.1),
+            nn.Linear(hidden_size, 1)
+        )
+
+    def forward(self, input_ids, attention_mask):
+        # Get hidden states from base model
+        outputs = self.base_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True
+        )
+
+        hidden_states = outputs.hidden_states[-1]
+
+        # Project to scalar values (one per token)
+        values = self.value_head(hidden_states).squeeze(-1)
+
+        return {"values": values}
+```
+
+**Key differences from policy model:**
+1. Output head: `hidden_size → 1` instead of `hidden_size → vocab_size`
+2. Per-token outputs: Value for each position
+3. Separate parameters: Value network has its own weights
+
+### Value Network Training
+
+The value network is trained to predict returns:
+
+$$
+L^{V} = \mathbb{E} \left[ (V_\theta(s_t) - \hat{R}_t)^2 \right]
+$$
+
+where $\hat{R}_t$ is the actual return (computed during rollout).
+
+From the PPO loss implementation:
+
+```python
+def compute_value_loss(
+    values: torch.Tensor,            # Predicted values
+    returns: torch.Tensor,           # Target returns (from GAE)
+    old_values: torch.Tensor,        # Values during rollout
+    mask: Optional[torch.Tensor] = None,
+    clip_value: bool = True,
+    clip_ratio: float = 0.2
+) -> tuple[torch.Tensor, Dict[str, float]]:
+    """Compute value function loss (MSE with optional clipping)."""
+
+    if clip_value:
+        # Clip value updates (similar to PPO policy clipping)
+        value_pred_clipped = old_values + torch.clamp(
+            values - old_values,
+            -clip_ratio,
+            clip_ratio
+        )
+
+        # Losses (unclipped and clipped)
+        value_loss_unclipped = (values - returns) ** 2
+        value_loss_clipped = (value_pred_clipped - returns) ** 2
+
+        # Take maximum (conservative update)
+        per_token_loss = torch.max(value_loss_unclipped, value_loss_clipped)
+    else:
+        # Standard MSE
+        per_token_loss = (values - returns) ** 2
+
+    # Average over tokens
+    loss = per_token_loss.sum() / num_tokens
+
+    return loss, {"value_loss": loss.item()}
+```
+
+**Why clip value loss?**
+- Same reason as policy clipping: prevent catastrophic updates
+- Value function changes can destabilize advantage estimates
+- Clipping keeps value learning gradual
+
+### Explained Variance
+
+A useful metric for value network quality:
+
+$$
+\text{Explained Variance} = 1 - \frac{\text{Var}(R - V)}{\text{Var}(R)}
+$$
+
+**Interpretation:**
+- EV = 1.0: Perfect predictions (V = R)
+- EV = 0.5: Value function explains 50% of variance
+- EV = 0.0: Value function no better than predicting mean
+- EV < 0.0: Value function worse than predicting mean!
+
+```python
+# Compute explained variance
+explained_variance = 1 - (
+    ((returns - values) ** 2).mean() /
+    (returns.var() + 1e-8)
+)
+```
+
+**Target:** EV > 0.8 (value function is making good predictions)
+
+## Phase 2: PPO Updates
+
+After generating rollouts and computing advantages, we enter the update phase.
+
+### Multiple PPO Epochs
+
+For each rollout batch, we perform multiple update epochs:
+
+```python
+# Rollout data (fixed during update phase)
+rollout_data = {
+    "responses": response_ids,
+    "old_logprobs": policy_logprobs,  # ← From rollout
+    "old_values": values,              # ← From rollout
+    "ref_logprobs": ref_logprobs,     # ← Never changes
+    "advantages": advantages,          # ← From GAE
+    "returns": returns,                # ← From GAE
+    "masks": response_mask
+}
+
+# Multiple epochs on same data
+for epoch in range(ppo_epochs):  # Typically 4
+    # Re-compute log probs and values (model updated!)
+    policy_logprobs_new = get_policy_logprobs(response_ids)
+    values_new = get_values(response_ids)
+
+    # Compute loss
+    loss = compute_ppo_total_loss(
+        policy_logprobs=policy_logprobs_new,  # ← Updated each epoch
+        old_logprobs=rollout_data["old_logprobs"],  # ← Fixed
+        ref_logprobs=rollout_data["ref_logprobs"],  # ← Fixed
+        values=values_new,                    # ← Updated each epoch
+        old_values=rollout_data["old_values"],  # ← Fixed
+        advantages=rollout_data["advantages"],  # ← Fixed
+        returns=rollout_data["returns"]         # ← Fixed
+    )
+
+    # Update
+    loss.backward()
+    optimizer.step()
+```
+
+**Key insight:** We recompute log probs and values each epoch because the model parameters have changed!
+
+### Why Multiple Epochs?
+
+**Sample efficiency:** Each rollout requires expensive generation. Reusing data improves efficiency.
+
+**But not too many:** After several epochs, distribution mismatch becomes too large (new policy ≠ rollout policy)
+
+**Typical range:** 3-5 epochs
+
+**Warning signs:**
+- Clip fraction > 50%: Policy changing too much, reduce epochs
+- KL divergence exploding: Too many epochs, reduce
+
+### Mini-Batching
+
+For large rollout buffers, we split into mini-batches:
+
+```python
+rollout_buffer_size = 64  # Total rollouts collected
+mini_batch_size = 16       # Update on 16 at a time
+
+for epoch in range(ppo_epochs):
+    # Shuffle and split into mini-batches
+    indices = torch.randperm(rollout_buffer_size)
+
+    for i in range(0, rollout_buffer_size, mini_batch_size):
+        batch_indices = indices[i:i + mini_batch_size]
+        batch = rollout_buffer.get_batch(batch_indices)
+
+        # Compute loss on mini-batch
+        loss = compute_ppo_total_loss(...)
+
+        # Update
+        loss.backward()
+        optimizer.step()
+```
+
+**Benefits:**
+- Better GPU utilization (larger batches)
+- More gradient updates per rollout
+- Reduced memory requirements
+
+## Training Dynamics Over Time
+
+### Early Training (Steps 1-10)
+
+**Policy behavior:**
+- Barely changed from SFT initialization
+- Responses similar to SFT model
+- KL divergence very small (< 0.01)
+
+**Value network:**
+- Learning to predict rewards
+- High value loss initially
+- Explained variance increasing (0.3 → 0.6)
+
+**Rewards:**
+- Slight improvement over SFT baseline
+- High variance (policy exploring)
+
+**Typical metrics:**
+```
+Step 5:
+  Mean reward: 7.2 (SFT baseline: 7.0)
+  KL divergence: 0.008
+  Clip fraction: 15%
+  Explained variance: 0.42
+```
+
+### Mid Training (Steps 10-50)
+
+**Policy behavior:**
+- Noticeably improved responses
+- More aligned with reward model preferences
+- KL divergence moderate (0.02-0.05)
+
+**Value network:**
+- Good predictions (EV > 0.8)
+- Stable value loss
+- Helping compute better advantages
+
+**Rewards:**
+- Steady improvement
+- Lower variance (policy more confident)
+
+**Typical metrics:**
+```
+Step 25:
+  Mean reward: 8.5 (improving!)
+  KL divergence: 0.035
+  Clip fraction: 25%
+  Explained variance: 0.85
+```
+
+### Late Training (Steps 50-100)
+
+**Policy behavior:**
+- Highly optimized responses
+- Pushing boundaries of KL constraint
+- Risk of reward hacking if unconstrained
+
+**Value network:**
+- Excellent predictions (EV > 0.9)
+- Low value loss
+
+**Rewards:**
+- Approaching plateau
+- Diminishing returns per update
+
+**Typical metrics:**
+```
+Step 75:
+  Mean reward: 9.1 (near optimal)
+  KL divergence: 0.048 (approaching limit)
+  Clip fraction: 18%
+  Explained variance: 0.92
+```
+
+### Signs of Convergence
+
+**Healthy convergence:**
+- ✅ Rewards plateaued at high level
+- ✅ KL stable (not increasing)
+- ✅ Low clip fraction (10-20%)
+- ✅ High explained variance (> 0.85)
+- ✅ Low variance in metrics
+
+**Unhealthy convergence (problems):**
+- ❌ Rewards dropped suddenly (mode collapse)
+- ❌ KL exploding (> 0.1) (distribution shift)
+- ❌ High clip fraction (> 50%) (unstable updates)
+- ❌ Low explained variance (< 0.5) (value network not learning)
+
+## The Complete Training Loop
+
+Here's the full training loop from [`src/auto_bot_tuner/rlhf/ppo_trainer.py`](https://github.com/yourusername/autotune/blob/main/src/auto_bot_tuner/rlhf/ppo_trainer.py):
+
+```python
+def train(self):
+    """Main PPO training loop."""
+
+    progress_bar = tqdm(total=self.config.num_rollouts)
+    rollout_count = 0
+    data_iter = iter(self.dataloader)
+
+    while rollout_count < self.config.num_rollouts:
+        # ═══════════════════════════════════════════════════════════
+        #                    PHASE 1: ROLLOUT
+        # ═══════════════════════════════════════════════════════════
+
+        # Get batch of prompts
+        try:
+            prompt_batch = next(data_iter)
+        except StopIteration:
+            data_iter = iter(self.dataloader)
+            prompt_batch = next(data_iter)
+
+        # Generate rollout (with torch.no_grad!)
+        rollout_data = self.generate_rollout(prompt_batch)
+
+        # Compute advantages using GAE
+        rollout_data = self.compute_advantages(rollout_data)
+
+        # ═══════════════════════════════════════════════════════════
+        #                    PHASE 2: UPDATE
+        # ═══════════════════════════════════════════════════════════
+
+        # Training step (multiple PPO epochs)
+        metrics = self.train_step(rollout_data)
+
+        # Update progress
+        rollout_count += 1
+        self.global_step += 1
+        progress_bar.update(1)
+
+        # Logging
+        if rollout_count % self.config.logging_steps == 0:
+            log_str = f"Step {rollout_count}: "
+            log_str += f"Loss={metrics['total_loss']:.4f}, "
+            log_str += f"Reward={metrics['mean_reward']:.4f}, "
+            log_str += f"KL={metrics.get('kl_kl', 0):.4f}, "
+            log_str += f"EV={metrics.get('explained_variance', 0):.3f}"
+            progress_bar.write(log_str)
+
+        # Checkpointing
+        if rollout_count % self.config.save_steps == 0:
+            self.save_checkpoint(f"step_{rollout_count}")
+
+    progress_bar.close()
+    self.save_checkpoint("final")
+```
+
+## Memory Management
+
+RLHF training requires managing four models simultaneously. Memory optimization is crucial.
+
+### Model Placement
+
+```python
+# Policy and value: GPU (need gradients)
+policy_model = policy_model.to(device)
+value_network = value_network.to(device)
+
+# Reference and reward: Could be CPU or GPU
+# GPU: Faster inference
+# CPU: Save GPU memory for gradients
+reference_model = reference_model.to(device)  # or to("cpu")
+reward_model = reward_model.to(device)        # or to("cpu")
+```
+
+**Trade-off:** GPU inference is faster, but uses memory. If memory-constrained, move frozen models to CPU.
+
+### Gradient Management
+
+```python
+# During rollout phase
+with torch.no_grad():  # Disable gradient computation
+    rollout_data = generate_rollout(prompts)
+    # Saves memory (no gradient tensors)
+
+# During update phase
+# Gradients enabled (default)
+loss = compute_loss(rollout_data)
+loss.backward()  # Compute gradients
+optimizer.step()  # Update parameters
+optimizer.zero_grad()  # Clear gradients
+```
+
+### Rollout Buffer Size
+
+```python
+# Larger buffer: More diverse data, better updates
+# Smaller buffer: Less memory, faster iteration
+
+buffer_size = 64  # Typical value
+
+# Memory usage ≈ buffer_size × sequence_length × (
+#   policy_logprobs (4 bytes) +
+#   ref_logprobs (4 bytes) +
+#   values (4 bytes) +
+#   advantages (4 bytes) +
+#   returns (4 bytes) +
+#   tokens (4 bytes)
+# )
+# ≈ 64 × 128 × 24 bytes = 196 KB (manageable!)
+```
+
+## Debugging Training Dynamics
+
+### Problem: Rewards Not Increasing
+
+**Possible causes:**
+1. Learning rate too low
+2. KL coefficient too high (policy can't change)
+3. Value network not learning (poor advantage estimates)
+4. Reward model saturated (all responses get similar scores)
+
+**Solutions:**
+```python
+# Increase learning rate
+config.learning_rate = 2e-6  # was 1e-6
+
+# Decrease KL coefficient
+config.kl_coef = 0.05  # was 0.1
+
+# Check value network
+print(f"Explained variance: {explained_variance:.3f}")
+if explained_variance < 0.5:
+    # Value network not learning
+    config.vf_coef = 1.0  # Increase value loss weight
+
+# Check reward distribution
+print(f"Reward mean: {rewards.mean():.2f}, std: {rewards.std():.2f}")
+if rewards.std() < 0.5:
+    # Rewards too similar, reward model issue
+    # Consider retraining reward model
+```
+
+### Problem: Training Unstable
+
+**Symptoms:**
+- Metrics oscillating wildly
+- KL divergence spiking
+- Occasional NaN losses
+
+**Solutions:**
+```python
+# Reduce learning rate
+config.learning_rate = 5e-7  # was 1e-6
+
+# Reduce PPO epochs
+config.ppo_epochs = 2  # was 4
+
+# Increase KL coefficient
+config.kl_coef = 0.2  # was 0.1
+
+# Stricter gradient clipping
+config.max_grad_norm = 0.1  # was 0.5
+
+# Check for NaNs
+if torch.isnan(loss):
+    print("NaN detected! Skipping update.")
+    optimizer.zero_grad()
+    continue
+```
+
+### Problem: Mode Collapse
+
+**Symptoms:**
+- All responses becoming similar
+- Entropy dropping to near 0
+- Single response for all prompts
+
+**Solutions:**
+```python
+# Increase entropy coefficient
+config.entropy_coef = 0.05  # was 0.01
+
+# Decrease KL coefficient (allow more exploration)
+config.kl_coef = 0.05  # was 0.1
+
+# Increase temperature during generation
+config.temperature = 1.2  # was 1.0
+
+# Check entropy metric
+print(f"Entropy: {entropy:.3f}")
+if entropy < 0.5:
+    print("Warning: Low entropy, risk of mode collapse!")
+```
+
+## Advanced: Batch-Level GAE
+
+For very long sequences, we can compute GAE at batch level instead of per-sequence:
+
+```python
+# Standard: Per-sequence GAE
+for i in range(batch_size):
+    adv, ret = compute_gae(rewards[i], values[i], gamma, lam)
+    advantages[i] = adv
+    returns[i] = ret
+
+# Alternative: Batch-level GAE (more efficient)
+advantages, returns = compute_gae(
+    rewards,  # (batch_size, seq_len)
+    values,   # (batch_size, seq_len)
+    gamma, lam
+)
+```
+
+Both are mathematically equivalent but batch-level is faster due to vectorization.
+
+## Further Reading
+
+**GAE:**
+- [High-Dimensional Continuous Control Using Generalized Advantage Estimation](https://arxiv.org/abs/1506.02438) - Original GAE paper
+- [Spinning Up: Advantage Estimation](https://spinningup.openai.com/en/latest/spinningup/rl_intro.html#advantage-functions)
+
+**Actor-Critic Methods:**
+- [Asynchronous Methods for Deep Reinforcement Learning (A3C)](https://arxiv.org/abs/1602.01783)
+- [Policy Gradient Methods](https://lilianweng.github.io/posts/2018-04-08-policy-gradient/)
+
+**RLHF Training:**
+- [Training language models to follow instructions (InstructGPT)](https://arxiv.org/abs/2203.02155)
+- [Fine-Tuning Language Models from Human Preferences](https://arxiv.org/abs/1909.08593)
+
+## Next Steps
+
+You now understand the complete training dynamics. The final piece is managing reference models:
+
+1. **[Reference Models](/rlhf/reference/)** - Deep dive into creating, using, and managing reference models
+2. **[PPO Algorithm](/rlhf/ppo/)** - Review the PPO objective in detail
+3. **[KL Penalty](/rlhf/kl-penalty/)** - Understand why KL penalty is critical
+
+Let's explore reference models in depth! 🔒

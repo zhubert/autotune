@@ -1,0 +1,311 @@
+---
+title: Introduction to Supervised Fine-Tuning (SFT)
+description: Learn the foundation of post-training - teaching models to follow instructions
+---
+
+import { Card, CardGrid, Aside } from '@astrojs/starlight/components';
+
+## What is Supervised Fine-Tuning?
+
+**Supervised Fine-Tuning (SFT)** is the first and most fundamental step in post-training. It teaches a pre-trained language model to follow instructions by training on examples of (instruction, response) pairs.
+
+<Aside type="note">
+  SFT is **always the first step** in post-training. RLHF, DPO, and other techniques build on top of an SFT model, never a base model directly.
+</Aside>
+
+### The Core Idea
+
+Pre-trained models are trained to predict the next token given previous context. They don't understand that:
+- Text starting with "Write a poem about" is an **instruction**
+- The appropriate response is a poem, not an essay about poetry
+- The response should be in a helpful "assistant" voice
+
+SFT solves this by showing the model thousands of examples:
+
+```
+Instruction: Write a haiku about machine learning.
+Response: Patterns in data,
+          Algorithms learn and grow,
+          Insights bloom from code.
+```
+
+After seeing enough examples, the model learns the pattern: "When given an instruction, generate an appropriate response."
+
+## Why SFT Comes First
+
+You might wonder: "Why not jump straight to RLHF or DPO?"
+
+<CardGrid>
+  <Card title="Distribution Shift" icon="warning">
+    RLHF/DPO optimize policies, but start from a terrible baseline. A base model doesn't even follow instructions, so there's nothing to optimize!
+  </Card>
+
+  <Card title="Sample Efficiency" icon="rocket">
+    SFT efficiently teaches the basic pattern. Then RLHF/DPO refine it. Skipping SFT wastes massive amounts of preference data trying to teach basics.
+  </Card>
+
+  <Card title="Stability" icon="approve-check">
+    Training RL directly on a base model is extremely unstable. SFT provides a reasonable initialization for preference learning.
+  </Card>
+</CardGrid>
+
+## The SFT Training Pipeline
+
+```
+┌─────────────────────────┐
+│  1. Dataset Preparation │
+│                         │
+│  Load instruction data  │
+│  (Alpaca, Dolly, etc.)  │
+└───────────┬─────────────┘
+            │
+            ▼
+┌─────────────────────────┐
+│  2. Format & Tokenize   │
+│                         │
+│  Convert to model input │
+│  Mask prompt tokens     │
+└───────────┬─────────────┘
+            │
+            ▼
+┌─────────────────────────┐
+│  3. Training Loop       │
+│                         │
+│  Compute masked loss    │
+│  Backprop & update      │
+└───────────┬─────────────┘
+            │
+            ▼
+┌─────────────────────────┐
+│  4. Evaluation          │
+│                         │
+│  Test on holdout set    │
+│  Generate samples       │
+└─────────────────────────┘
+```
+
+## The Mathematics of SFT
+
+### Standard Language Modeling
+
+Pre-training optimizes:
+
+$$
+\mathcal{L}_{\text{LM}} = -\mathbb{E}_{x \sim D} \left[ \sum_{t=1}^{T} \log P_\theta(x_t | x_{<t}) \right]
+$$
+
+This trains the model to predict **every** next token.
+
+### SFT: Masked Language Modeling
+
+SFT instead optimizes:
+
+$$
+\mathcal{L}_{\text{SFT}} = -\mathbb{E}_{(p, r) \sim D_{\text{instr}}} \left[ \sum_{t \in \text{response}} \log P_\theta(r_t | p, r_{<t}) \right]
+$$
+
+where:
+- $p$ is the **prompt** (instruction + context)
+- $r$ is the **response** (what the assistant should say)
+- $t \in \text{response}$ means we only sum over response tokens
+
+**Key difference:** We only compute loss on the response, not the prompt!
+
+### Why Mask the Prompt?
+
+Consider this example:
+
+```
+Text: "### Instruction:\nWhat is 2+2?\n\n### Response:\n4"
+```
+
+Without masking:
+- Model learns to predict "What" given "Instruction"
+- Model learns to predict "is" given "What"
+- ...learns to predict "4" given "Response:\n"
+
+This teaches the model to **continue the instruction format**, not to respond to instructions!
+
+With masking:
+- Prompt tokens have labels = -100 (ignored in loss)
+- Only "4" has a real label
+- Model **only** learns to generate appropriate responses
+
+<Aside type="tip">
+  Think of masking as focusing the model's attention: "Don't learn to predict the question, learn to generate the answer!"
+</Aside>
+
+## Training Efficiency: LoRA
+
+Training full model weights requires:
+- Updating billions of parameters
+- Storing optimizer states (2-3x model size)
+- Massive memory usage
+
+**LoRA (Low-Rank Adaptation)** solves this by training small "adapter" matrices:
+
+$$
+h = W_0 x + \Delta W x = W_0 x + BA x
+$$
+
+where:
+- $W_0$ is the frozen pre-trained weight (e.g., 4096 × 4096)
+- $B$ and $A$ are trainable (4096 × 16 and 16 × 4096)
+- Total trainable params: $2 \times 4096 \times 16 = 131,072$ instead of 16,777,216
+
+**Memory savings:** ~100x fewer trainable parameters!
+
+### LoRA in Practice
+
+For GPT-2, we apply LoRA to:
+- `c_attn` (attention QKV projection)
+- `c_proj` (attention output projection)
+
+This is ~5% of total parameters but captures most of the adaptation needed.
+
+## Common Datasets for SFT
+
+### Alpaca (52K examples)
+
+```json
+{
+  "instruction": "Give three tips for staying healthy.",
+  "input": "",
+  "output": "1. Eat a balanced diet..."
+}
+```
+
+**Strengths:** Clean, diverse tasks, good starting point
+**Weaknesses:** Some examples are low quality
+
+### Dolly (15K examples)
+
+```json
+{
+  "instruction": "What is the capital of France?",
+  "input": "",
+  "output": "The capital of France is Paris."
+}
+```
+
+**Strengths:** High quality, human-written
+**Weaknesses:** Smaller dataset
+
+### OpenAssistant (161K conversations)
+
+```json
+{
+  "messages": [
+    {"role": "user", "content": "Explain quantum computing"},
+    {"role": "assistant", "content": "Quantum computing..."}
+  ]
+}
+```
+
+**Strengths:** Conversational, multi-turn
+**Weaknesses:** Quality varies
+
+## SFT Training Hyperparameters
+
+Typical settings for GPT-2 with LoRA:
+
+| Hyperparameter | Value | Reasoning |
+|----------------|-------|-----------|
+| **Learning Rate** | 2e-4 to 5e-4 | Higher than pre-training (LoRA is more stable) |
+| **Batch Size** | 16-32 | Larger is better, limited by memory |
+| **Epochs** | 3-5 | More risks overfitting |
+| **Max Length** | 512-1024 | Longer captures more context |
+| **LoRA Rank** | 8-16 | 16 is a sweet spot |
+| **LoRA Alpha** | 32 | Typically 2x rank |
+| **Weight Decay** | 0.01 | Regularization |
+| **Warmup Steps** | 100-500 | Stable training start |
+
+<Aside type="caution">
+  **Overfitting warning:** Models can memorize training data. Always keep a validation set and monitor validation loss!
+</Aside>
+
+## Expected Results
+
+After SFT on Alpaca, you should see:
+
+**Before (base model):**
+```
+Input: What is the capital of France?
+Output: is it Paris or Lyon? Some people think...
+```
+
+**After (SFT model):**
+```
+Input: What is the capital of France?
+Output: The capital of France is Paris.
+```
+
+### Training Metrics
+
+Typical training curves:
+
+- **Training loss:** Starts ~3.0, converges to ~1.5-2.0
+- **Validation loss:** Should track training (gap < 0.3)
+- **Perplexity:** Starts ~20, converges to ~5-7
+- **Accuracy:** Token-level accuracy ~50-60%
+
+If validation loss diverges from training, you're overfitting!
+
+## What SFT Doesn't Do
+
+SFT is powerful but limited:
+
+❌ **Doesn't align preferences** - Model follows instructions but doesn't optimize for "better" responses
+❌ **Doesn't handle complex preferences** - Can't learn subtle human values from demonstrations alone
+❌ **Doesn't prevent harmful outputs** - Model learns format but not safety
+❌ **Limited by demonstration quality** - Can only imitate, not improve upon training data
+
+This is why we need RLHF or DPO as next steps!
+
+## Code Example
+
+Here's the complete SFT pipeline:
+
+```python
+from src.auto_bot_tuner.sft import SFTTrainer, SFTConfig, InstructionDataset
+from src.auto_bot_tuner.utils.model_loading import load_model_and_tokenizer
+from datasets import load_dataset
+
+# Load model with LoRA
+model, tokenizer, device = load_model_and_tokenizer(
+    "gpt2",
+    use_lora=True
+)
+
+# Load dataset
+raw_dataset = load_dataset("yahma/alpaca-cleaned", split="train")
+dataset = InstructionDataset(
+    raw_dataset,
+    tokenizer,
+    max_length=512,
+    format_type="alpaca"
+)
+
+# Configure training
+config = SFTConfig(
+    learning_rate=3e-4,
+    batch_size=16,
+    num_epochs=3,
+    max_length=512
+)
+
+# Train!
+trainer = SFTTrainer(model, tokenizer, dataset, config)
+trainer.train()
+```
+
+## Next Steps
+
+Now that you understand the basics, dive deeper:
+
+1. **[Instruction Formatting](/sft/formatting/)** - How to structure instruction data
+2. **[Loss Masking](/sft/loss-masking/)** - Why and how we mask prompts
+3. **[Training Loop](/sft/training/)** - Implementation details
+4. **[LoRA Fine-Tuning](/sft/lora/)** - Efficient training with adapters
+
+Let's start with instruction formatting! 📝

@@ -1,0 +1,1101 @@
+---
+title: DPO Training - Complete Guide
+description: End-to-end DPO training procedure, from data preparation to model evaluation, with hyperparameters, metrics, and troubleshooting
+---
+
+import { Card, CardGrid, Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+## Training Overview
+
+Direct Preference Optimization training follows a straightforward supervised learning procedure. This guide covers the complete pipeline from start to finish.
+
+## Prerequisites
+
+Before starting DPO training, ensure you have:
+
+1. ✅ **Trained SFT model** - DPO starts from an instruction-following model, not a base model
+2. ✅ **Preference dataset** - Pairs of (prompt, chosen, rejected) responses
+3. ✅ **Validation split** - For monitoring generalization and preventing overfitting
+4. ✅ **Compute resources** - GPU with sufficient memory (16GB+ recommended)
+
+<Aside type="caution" title="Critical: Start from SFT">
+  **Never train DPO directly on a base model!** DPO refines preferences but doesn't teach basic instruction-following. Always start from an SFT checkpoint.
+</Aside>
+
+## The Complete Training Pipeline
+
+```
+┌─────────────────────────────────┐
+│ 1. Prepare Data                 │
+│    - Load preference dataset    │
+│    - Create train/val splits    │
+│    - Tokenize and batch         │
+└────────────┬────────────────────┘
+             │
+             ▼
+┌─────────────────────────────────┐
+│ 2. Initialize Models            │
+│    - Load SFT model as policy   │
+│    - Create reference (frozen)  │
+│    - Setup optimizer            │
+└────────────┬────────────────────┘
+             │
+             ▼
+┌─────────────────────────────────┐
+│ 3. Training Loop                │
+│    - Forward: policy + ref      │
+│    - Compute DPO loss           │
+│    - Backprop (policy only)     │
+│    - Log metrics                │
+└────────────┬────────────────────┘
+             │
+             ▼
+┌─────────────────────────────────┐
+│ 4. Evaluation                   │
+│    - Test on validation set     │
+│    - Generate samples           │
+│    - Compare with SFT baseline  │
+└─────────────────────────────────┘
+```
+
+## Step 1: Data Preparation
+
+### Loading Preference Datasets
+
+```python
+from datasets import load_dataset
+from src.auto_bot_tuner.dpo import PreferenceDataset
+
+# Load from HuggingFace
+raw_data = load_dataset("Anthropic/hh-rlhf", split="train")
+
+# Common preference datasets:
+# - "Anthropic/hh-rlhf" (161K, helpfulness + harmlessness)
+# - "lvwerra/stack-exchange-paired" (10M, programming Q&A)
+# - "Dahoas/rm-static" (76K, various tasks)
+```
+
+### Dataset Format Requirements
+
+Your dataset must have these columns:
+
+| Column | Type | Description | Example |
+|--------|------|-------------|---------|
+| `prompt` | str | The input context | "Explain quantum computing" |
+| `chosen` | str | Preferred response | "Quantum computers use..." |
+| `rejected` | str | Non-preferred response | "It's complicated stuff..." |
+
+**Verify your dataset:**
+
+```python
+from src.auto_bot_tuner.dpo import validate_preference_dataset
+
+# Raises error if columns missing
+validate_preference_dataset(raw_data)
+
+# Preview a sample
+from src.auto_bot_tuner.dpo import preview_preference_sample
+
+train_dataset = PreferenceDataset(raw_data, tokenizer, max_length=512)
+sample = preview_preference_sample(train_dataset, idx=0)
+
+print(f"Prompt: {sample['prompt']}")
+print(f"Chosen: {sample['chosen_full']}")
+print(f"Rejected: {sample['rejected_full']}")
+print(f"Lengths: {sample['chosen_length']}, {sample['rejected_length']}")
+```
+
+### Creating Train/Validation Splits
+
+```python
+# Split dataset
+raw_train = raw_data.train_test_split(test_size=0.1, seed=42)
+train_data = raw_train["train"]
+val_data = raw_train["test"]
+
+# Create PyTorch datasets
+train_dataset = PreferenceDataset(
+    train_data,
+    tokenizer,
+    max_length=512,
+    max_prompt_length=256  # Optional: limit prompt length
+)
+
+val_dataset = PreferenceDataset(
+    val_data,
+    tokenizer,
+    max_length=512,
+    max_prompt_length=256
+)
+
+print(f"Training samples: {len(train_dataset)}")
+print(f"Validation samples: {len(val_dataset)}")
+```
+
+### Data Quality Checks
+
+<Aside type="tip" title="Sanity Checks">
+  Always inspect your data before training! Common issues:
+  - **Swapped labels:** Chosen is actually worse than rejected
+  - **Duplicate pairs:** Same prompt with contradictory preferences
+  - **Empty responses:** Blank chosen or rejected strings
+  - **Format issues:** Special characters, truncation artifacts
+</Aside>
+
+```python
+# Check for common issues
+from collections import Counter
+
+def check_preference_quality(dataset):
+    issues = []
+
+    for i in range(len(dataset)):
+        item = dataset[i]
+
+        # Check for empty responses
+        if not item["chosen"].strip():
+            issues.append(f"Empty chosen at {i}")
+        if not item["rejected"].strip():
+            issues.append(f"Empty rejected at {i}")
+
+        # Check for identical responses (no preference signal)
+        if item["chosen"] == item["rejected"]:
+            issues.append(f"Identical responses at {i}")
+
+        # Check for suspiciously short responses
+        if len(item["chosen"].split()) < 3:
+            issues.append(f"Very short chosen at {i}")
+
+    return issues
+
+issues = check_preference_quality(train_data)
+print(f"Found {len(issues)} potential issues")
+```
+
+## Step 2: Model Initialization
+
+### Load Policy Model (SFT Checkpoint)
+
+```python
+from src.auto_bot_tuner.utils.model_loading import load_model_and_tokenizer
+
+# Load your trained SFT model
+policy_model, tokenizer, device = load_model_and_tokenizer(
+    "path/to/sft_checkpoint",  # Your SFT model
+    use_lora=True,  # Recommended: use LoRA for efficiency
+    lora_r=16,
+    lora_alpha=32,
+    lora_dropout=0.1
+)
+
+print(f"Loaded policy model on {device}")
+print(f"Model parameters: {sum(p.numel() for p in policy_model.parameters()) / 1e6:.1f}M")
+print(f"Trainable parameters: {sum(p.numel() for p in policy_model.parameters() if p.requires_grad) / 1e6:.1f}M")
+```
+
+<Aside type="note">
+  **LoRA is highly recommended** for DPO training. It reduces memory usage and training time while maintaining performance. Use rank=16, alpha=32 for GPT-2 style models.
+</Aside>
+
+### Create Reference Model
+
+The reference model is a **frozen deep copy** of the initial policy model:
+
+```python
+from src.auto_bot_tuner.dpo import create_reference_model
+
+# Create frozen reference (deep copy of policy)
+reference_model = create_reference_model(policy_model, device)
+
+# Verify reference is frozen
+assert not any(p.requires_grad for p in reference_model.parameters())
+print("Reference model created and frozen")
+```
+
+**Why a deep copy?**
+- Reference must stay identical to initial policy throughout training
+- Shallow copy would share weights with policy → reference would change!
+- Deep copy ensures complete independence
+
+**Memory optimization:**
+```python
+# Reference is inference-only, can use lower precision
+reference_model = reference_model.half()  # fp16
+# or
+reference_model = reference_model.bfloat16()  # bf16 (better for training)
+```
+
+### Verify Models Match Initially
+
+```python
+import torch
+
+# Generate sample to verify models are identical
+test_input = tokenizer("Hello world", return_tensors="pt").to(device)
+
+with torch.no_grad():
+    policy_out = policy_model(**test_input).logits
+    ref_out = reference_model(**test_input).logits
+
+# Should be identical (within floating point error)
+diff = (policy_out - ref_out).abs().max().item()
+assert diff < 1e-5, f"Models don't match! Diff: {diff}"
+print("✓ Policy and reference models verified identical")
+```
+
+## Step 3: Training Configuration
+
+### DPO Hyperparameters
+
+From `src/auto_bot_tuner/dpo/trainer.py`:
+
+```python
+from src.auto_bot_tuner.dpo import DPOConfig
+
+config = DPOConfig(
+    # DPO-specific parameters
+    beta=0.1,                    # KL penalty strength (0.1-0.5, start with 0.1)
+    label_smoothing=0.0,         # Label smoothing (0-0.3, start with 0.0)
+
+    # Training hyperparameters
+    learning_rate=5e-7,          # MUCH lower than SFT!
+    batch_size=4,                # Limited by memory
+    gradient_accumulation_steps=4,  # Effective batch = 16
+    num_epochs=1,                # Usually 1 epoch is enough
+    max_steps=None,              # Or set specific step limit
+    warmup_steps=50,             # Short warmup
+    max_grad_norm=1.0,           # Gradient clipping
+
+    # Optimization
+    weight_decay=0.01,
+    adam_beta1=0.9,
+    adam_beta2=0.999,
+    adam_epsilon=1e-8,
+
+    # Logging and checkpointing
+    logging_steps=10,            # Log frequently
+    eval_steps=500,              # Evaluate periodically
+    save_steps=500,              # Save checkpoints
+    save_total_limit=3,          # Keep only 3 checkpoints
+
+    # Paths
+    output_dir="checkpoints/dpo",
+    resume_from_checkpoint=None,
+
+    # Mixed precision
+    fp16=False,                  # Use fp16 if GPU supports it
+    bf16=False,                  # Or bf16 (better for training)
+
+    # Misc
+    seed=42,
+    dataloader_num_workers=0     # 0 for debugging, 4+ for speed
+)
+```
+
+### Hyperparameter Recommendations
+
+<CardGrid>
+  <Card title="Learning Rate">
+    **Range:** 1e-7 to 1e-6
+
+    **Default:** 5e-7 (10x lower than SFT!)
+
+    **Why so low?**
+    - DPO loss is more sensitive than SFT
+    - Policy starts from good initialization (SFT)
+    - Small updates preserve model quality
+
+    **Adjust:**
+    - Too high: Loss oscillates, KL explodes
+    - Too low: No learning, loss plateaus early
+  </Card>
+
+  <Card title="Beta (β)">
+    **Range:** 0.05 to 0.5
+
+    **Default:** 0.1
+
+    **Effect:**
+    - Lower β: More aggressive, higher divergence
+    - Higher β: More conservative, stays closer to reference
+
+    **Adjust:**
+    - Incoherent generations → increase β to 0.2-0.5
+    - No improvement over SFT → decrease β to 0.05
+  </Card>
+
+  <Card title="Batch Size">
+    **Range:** 2 to 8 per GPU
+
+    **Default:** 4
+
+    **With gradient accumulation:**
+    - Effective batch = batch_size × accumulation_steps
+    - Target effective batch: 16-32
+
+    **Memory:**
+    - Each sample needs 2 forward passes (chosen + rejected)
+    - Plus reference model forwards (no backprop)
+  </Card>
+
+  <Card title="Epochs">
+    **Range:** 1 to 3
+
+    **Default:** 1
+
+    **Why just 1?**
+    - DPO is very data-efficient
+    - Overfitting risk increases with more epochs
+    - Most learning happens in first epoch
+
+    **Use 2-3 epochs only if:**
+    - Very small dataset (&lt;10K)
+    - Monitor validation carefully
+  </Card>
+</CardGrid>
+
+### Memory Requirements
+
+**Estimating memory for 1B parameter model with LoRA:**
+
+| Component | Memory (GB) |
+|-----------|-------------|
+| Policy model (fp32) | 4 |
+| Reference model (fp16) | 2 |
+| Optimizer states (LoRA only) | 0.5 |
+| Activations (batch=4) | 4 |
+| Gradients | 2 |
+| **Total** | **~12-14 GB** |
+
+**For different model sizes:**
+- GPT-2 (124M): ~6 GB with LoRA
+- GPT-2 Medium (355M): ~8 GB with LoRA
+- GPT-2 Large (774M): ~10 GB with LoRA
+- GPT-2 XL (1.5B): ~16 GB with LoRA
+- LLaMA 7B: ~32 GB with LoRA
+
+<Aside type="tip">
+  **Out of memory?**
+  1. Reduce batch size
+  2. Enable gradient checkpointing: `policy_model.gradient_checkpointing_enable()`
+  3. Use mixed precision: `fp16=True` or `bf16=True`
+  4. Lower LoRA rank: `lora_r=8` instead of 16
+</Aside>
+
+## Step 4: Training Loop
+
+### Initialize Trainer
+
+```python
+from src.auto_bot_tuner.dpo import DPOTrainer
+
+trainer = DPOTrainer(
+    policy_model=policy_model,
+    reference_model=reference_model,
+    tokenizer=tokenizer,
+    train_dataset=train_dataset,
+    eval_dataset=val_dataset,  # Optional but recommended
+    config=config,
+    callbacks=[]  # Optional custom callbacks
+)
+
+print("Trainer initialized")
+print(f"Training samples: {len(train_dataset)}")
+print(f"Validation samples: {len(val_dataset)}")
+print(f"Steps per epoch: {len(train_dataset) // (config.batch_size * config.gradient_accumulation_steps)}")
+```
+
+### Start Training
+
+```python
+# Train!
+results = trainer.train()
+
+print(f"Training completed!")
+print(f"Total steps: {results['total_steps']}")
+print(f"Epochs completed: {results['epochs_completed']}")
+if results['best_eval_accuracy']:
+    print(f"Best validation accuracy: {results['best_eval_accuracy']:.3f}")
+```
+
+### What Happens During Training
+
+**Each training step:**
+
+1. **Sample batch** of preference pairs
+2. **Forward pass:** Policy model on chosen responses → logits
+3. **Forward pass:** Policy model on rejected responses → logits
+4. **Forward pass (no grad):** Reference model on chosen responses → logits
+5. **Forward pass (no grad):** Reference model on rejected responses → logits
+6. **Compute log probabilities** for all sequences
+7. **Compute DPO loss** with metrics
+8. **Backward pass** (only through policy model)
+9. **Accumulate gradients** (if using gradient accumulation)
+10. **Update weights** (every accumulation_steps)
+11. **Log metrics** (every logging_steps)
+12. **Evaluate** (every eval_steps)
+13. **Save checkpoint** (every save_steps)
+
+## Step 5: Monitoring Training
+
+### Key Metrics to Watch
+
+<Tabs>
+  <TabItem label="Loss">
+
+**What it is:** Negative log-likelihood of preferences being correct
+
+**Expected behavior:**
+```
+Start: ~0.69 (random, 50% accuracy)
+After 100 steps: ~0.5-0.6
+Converged: ~0.3-0.5
+```
+
+**Warning signs:**
+- ⚠️ **Stays at 0.69:** Not learning (check LR, β, gradients)
+- ⚠️ **Increases:** Overfitting or unstable (reduce LR)
+- ⚠️ **Oscillates:** Learning rate too high
+- ⚠️ **NaN/Inf:** Numerical instability or bad data
+
+</TabItem>
+
+  <TabItem label="Accuracy">
+
+**What it is:** Fraction of examples where $r_{\text{chosen}} > r_{\text{rejected}}$
+
+**Expected behavior:**
+```
+Start: ~50% (random)
+After 100 steps: ~55-60%
+Converged: ~65-80%
+```
+
+**Interpretation:**
+- **60-70%:** Good, model learning preferences
+- **70-80%:** Very good, strong preference learning
+- **80-90%:** Excellent, but check for overfitting
+- **>90%:** Likely overfitting or very easy dataset
+
+**Warning signs:**
+- ⚠️ **Stays at 50%:** No learning (increase steps or check β)
+- ⚠️ **Train/val gap > 15%:** Overfitting (stop early)
+
+</TabItem>
+
+  <TabItem label="Reward Margin">
+
+**What it is:** Average $r_{\text{chosen}} - r_{\text{rejected}}$
+
+**Expected behavior:**
+```
+Start: ~0 (policy = reference)
+After 100 steps: ~0.5-1.0
+Converged: ~1-5 (depending on β)
+```
+
+**Interpretation:**
+- **Margin > 0:** Correct preference direction (good!)
+- **Larger margin:** Stronger preference signal
+- **Margin ~ β:** Typical magnitude (β=0.1 → margin~1)
+
+**Warning signs:**
+- ⚠️ **Negative margin:** Model confused (check data)
+- ⚠️ **Margin > 10:** Possible divergence (increase β)
+
+</TabItem>
+
+  <TabItem label="KL Divergence">
+
+**What it is:** How much policy has diverged from reference
+
+**Expected behavior:**
+```
+Start: ~0 (policy = reference)
+After 100 steps: ~0.1-0.5
+Converged: ~0.5-2.0 (depending on β)
+```
+
+**Interpretation:**
+- **Small KL (< 1):** Policy staying close to reference
+- **Medium KL (1-3):** Healthy divergence
+- **Large KL (> 5):** Significant divergence, check quality
+
+**Warning signs:**
+- ⚠️ **KL stays at 0:** Not learning (decrease β, increase LR)
+- ⚠️ **KL > 10:** Too much divergence (increase β, decrease LR)
+- ⚠️ **KL increasing exponentially:** Instability (reduce LR)
+
+</TabItem>
+</Tabs>
+
+### Example Training Curves
+
+**Healthy training:**
+```
+Step  | Loss  | Acc   | Margin | KL    | LR
+------|-------|-------|--------|-------|-------
+0     | 0.693 | 0.500 | 0.00   | 0.00  | 0.0e0
+50    | 0.623 | 0.565 | 0.45   | 0.18  | 5.0e-7
+100   | 0.547 | 0.628 | 0.89   | 0.42  | 5.0e-7
+200   | 0.458 | 0.702 | 1.52   | 0.81  | 5.0e-7
+500   | 0.385 | 0.758 | 2.13   | 1.24  | 4.5e-7
+1000  | 0.352 | 0.773 | 2.35   | 1.45  | 3.5e-7
+```
+
+**Problematic training (too aggressive):**
+```
+Step  | Loss  | Acc   | Margin | KL    | LR
+------|-------|-------|--------|-------|-------
+0     | 0.693 | 0.500 | 0.00   | 0.00  | 5.0e-6  ⚠️ Too high!
+50    | 0.412 | 0.821 | 5.45   | 4.12  | 5.0e-6  ⚠️ Too fast!
+100   | 0.254 | 0.912 | 12.3   | 9.87  | 5.0e-6  ⚠️ Diverging!
+150   | NaN   | NaN   | NaN    | NaN   | 5.0e-6  💥 Collapsed!
+```
+
+### Logging Examples
+
+DPO trainer logs every `logging_steps`:
+
+```
+DPO Training: 100%|████████| 1000/1000 [12:34<00:00, 1.32it/s, loss=0.385, acc=0.758, margin=2.13, lr=4.5e-7]
+
+Step 500/1000:
+  loss: 0.385
+  accuracy: 0.758
+  reward_margin: 2.13
+  chosen_reward: 2.89
+  rejected_reward: 0.76
+  kl_divergence: 1.24
+  learning_rate: 4.5e-7
+```
+
+## Step 6: Evaluation
+
+### Automatic Evaluation
+
+The trainer automatically evaluates on `eval_dataset` every `eval_steps`:
+
+```python
+# Evaluation metrics
+eval_metrics = trainer.evaluate()
+
+print(f"Validation Loss: {eval_metrics['loss']:.4f}")
+print(f"Validation Accuracy: {eval_metrics['accuracy']:.4f}")
+print(f"Validation Margin: {eval_metrics['reward_margin']:.4f}")
+```
+
+**Healthy eval metrics:**
+- Val accuracy within 5% of train accuracy
+- Val loss similar to train loss
+- Reward margin positive and growing
+
+### Generation Comparison
+
+Compare SFT baseline with DPO trained model:
+
+```python
+# Load SFT baseline
+sft_model, sft_tokenizer, _ = load_model_and_tokenizer("path/to/sft_model")
+
+# Test prompts
+test_prompts = [
+    "Explain quantum computing to a 10-year-old.",
+    "Write a haiku about machine learning.",
+    "What are the ethical considerations of AI?"
+]
+
+for prompt in test_prompts:
+    print(f"\n{'='*60}")
+    print(f"Prompt: {prompt}")
+    print(f"{'='*60}")
+
+    # SFT baseline
+    sft_input = sft_tokenizer(prompt, return_tensors="pt").to(device)
+    sft_output = sft_model.generate(**sft_input, max_length=200, do_sample=True, temperature=0.7)
+    sft_text = sft_tokenizer.decode(sft_output[0], skip_special_tokens=True)
+    print(f"\n[SFT] {sft_text}")
+
+    # DPO trained
+    dpo_input = tokenizer(prompt, return_tensors="pt").to(device)
+    dpo_output = policy_model.generate(**dpo_input, max_length=200, do_sample=True, temperature=0.7)
+    dpo_text = tokenizer.decode(dpo_output[0], skip_special_tokens=True)
+    print(f"\n[DPO] {dpo_text}")
+```
+
+### Human Evaluation
+
+The gold standard for preference learning:
+
+```python
+def human_eval_comparison(policy_model, sft_model, tokenizer, test_prompts, num_raters=3):
+    """
+    Generate responses from both models and collect human preferences.
+    """
+    results = []
+
+    for prompt in test_prompts:
+        # Generate from both models
+        sft_response = generate_response(sft_model, tokenizer, prompt)
+        dpo_response = generate_response(policy_model, tokenizer, prompt)
+
+        # Randomly shuffle (blind evaluation)
+        import random
+        responses = [(sft_response, "SFT"), (dpo_response, "DPO")]
+        random.shuffle(responses)
+
+        # Collect preferences from raters
+        for rater in range(num_raters):
+            print(f"\n{'='*60}")
+            print(f"Prompt: {prompt}")
+            print(f"\n[Response A] {responses[0][0]}")
+            print(f"\n[Response B] {responses[1][0]}")
+
+            preference = input("Which is better? (A/B/Tie): ").strip().upper()
+
+            results.append({
+                "prompt": prompt,
+                "preference": preference,
+                "winner": responses[0][1] if preference == "A" else responses[1][1]
+            })
+
+    # Compute win rate
+    dpo_wins = sum(1 for r in results if r["winner"] == "DPO")
+    total = len(results)
+    print(f"\nDPO Win Rate: {dpo_wins}/{total} = {100*dpo_wins/total:.1f}%")
+
+    return results
+```
+
+**Expected DPO win rate vs SFT:** 60-75%
+
+## Step 7: Saving and Loading
+
+### Save Trained Model
+
+```python
+# Final checkpoint is saved automatically
+final_model_path = Path(config.output_dir) / "final"
+
+# Or save manually
+policy_model.save_pretrained("my_dpo_model")
+tokenizer.save_pretrained("my_dpo_model")
+```
+
+### Load for Inference
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# Load DPO trained model
+model = AutoModelForCausalLM.from_pretrained("my_dpo_model")
+tokenizer = AutoTokenizer.from_pretrained("my_dpo_model")
+
+# Generate
+prompt = "Explain neural networks."
+inputs = tokenizer(prompt, return_tensors="pt")
+outputs = model.generate(**inputs, max_length=200)
+response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+print(response)
+```
+
+### Merge LoRA Weights
+
+If you used LoRA, you can merge adapters into base model for easier deployment:
+
+```python
+from peft import PeftModel
+
+# Load base model
+base_model = AutoModelForCausalLM.from_pretrained("gpt2")
+
+# Load LoRA adapters
+model = PeftModel.from_pretrained(base_model, "my_dpo_model")
+
+# Merge and unload
+merged_model = model.merge_and_unload()
+
+# Save merged model
+merged_model.save_pretrained("my_dpo_model_merged")
+```
+
+## Troubleshooting Common Issues
+
+### Issue 1: Loss Not Decreasing
+
+**Symptoms:**
+- Loss stays around 0.69 after 100+ steps
+- Accuracy stuck at 50%
+- Reward margin near 0
+
+**Diagnosis:**
+```python
+# Check learning rate
+print(f"Learning rate: {trainer.scheduler.get_last_lr()[0]}")
+# Should be 1e-7 to 1e-6
+
+# Check gradients
+for name, param in policy_model.named_parameters():
+    if param.requires_grad and param.grad is not None:
+        print(f"{name}: grad norm = {param.grad.norm().item():.6f}")
+# Should see non-zero gradients
+
+# Check beta
+print(f"Beta: {config.beta}")
+# Try decreasing to 0.05 if very high (>0.5)
+```
+
+**Solutions:**
+1. Increase learning rate: 5e-7 → 1e-6
+2. Decrease beta: 0.5 → 0.1
+3. Check data quality (run sanity checks above)
+4. Ensure reference model is actually frozen
+5. Train for more steps (may just need patience)
+
+### Issue 2: Training Unstable
+
+**Symptoms:**
+- Loss oscillates wildly
+- NaN or Inf values
+- KL divergence exploding
+
+**Diagnosis:**
+```python
+# Check for NaN in data
+for i, batch in enumerate(train_loader):
+    if torch.isnan(batch["chosen_input_ids"]).any():
+        print(f"NaN in batch {i}")
+
+# Check model outputs
+with torch.no_grad():
+    test_output = policy_model(**test_input)
+    if torch.isnan(test_output.logits).any():
+        print("Model producing NaN!")
+
+# Monitor gradient norms
+grad_norms = []
+for param in policy_model.parameters():
+    if param.grad is not None:
+        grad_norms.append(param.grad.norm().item())
+print(f"Max gradient norm: {max(grad_norms):.2f}")
+# Should be < 10; if > 100, you have exploding gradients
+```
+
+**Solutions:**
+1. Reduce learning rate: 5e-7 → 1e-7
+2. Increase gradient clipping: `max_grad_norm=0.5`
+3. Use mixed precision carefully: Try `bf16=True` instead of `fp16`
+4. Check for corrupted data (NaNs, extreme values)
+5. Increase beta for more stability: 0.1 → 0.2
+
+### Issue 3: Overfitting
+
+**Symptoms:**
+- Training accuracy 85%+, validation 60%
+- Large train/val loss gap
+- Great on training data, poor on new prompts
+
+**Diagnosis:**
+```python
+# Compare train vs val metrics
+train_acc = 0.85
+val_acc = 0.62
+gap = train_acc - val_acc
+print(f"Train/val gap: {gap:.3f}")
+# Gap > 0.15 indicates overfitting
+
+# Check dataset size
+print(f"Training samples: {len(train_dataset)}")
+# < 10K may be too small for multi-epoch training
+```
+
+**Solutions:**
+1. Stop training earlier (use `max_steps` to limit)
+2. Train for only 1 epoch (reduce `num_epochs`)
+3. Increase beta for more regularization: 0.1 → 0.2
+4. Use label smoothing: `label_smoothing=0.1`
+5. Collect more training data
+6. Increase validation frequency to catch overfitting early
+
+### Issue 4: Model Generates Incoherent Text
+
+**Symptoms:**
+- High reward margins but nonsense generations
+- Grammatical errors, repetition, irrelevance
+- KL divergence > 10
+
+**Diagnosis:**
+```python
+# Generate samples and inspect
+test_prompts = ["Hello, how are you?", "Explain gravity."]
+for prompt in test_prompts:
+    response = generate(policy_model, tokenizer, prompt)
+    print(f"\nPrompt: {prompt}")
+    print(f"Response: {response}")
+    print(f"Quality: {'GOOD' if is_coherent(response) else 'BAD'}")
+
+# Check KL divergence
+print(f"Final KL divergence: {trainer.kl_divergence:.2f}")
+# > 5 is concerning, > 10 indicates serious divergence
+```
+
+**Solutions:**
+1. Increase beta significantly: 0.1 → 0.5
+2. Reduce learning rate: 5e-7 → 1e-7
+3. Train for fewer steps
+4. Check if reference model is truly frozen
+5. Restart training with more conservative hyperparameters
+
+### Issue 5: Poor Preference Learning
+
+**Symptoms:**
+- Accuracy plateaus at 55-60%
+- Reward margin < 0.5 after convergence
+- Model barely different from SFT baseline
+
+**Diagnosis:**
+```python
+# Check data quality
+# Are preferences meaningful?
+for i in range(10):
+    item = train_dataset.dataset[i]
+    print(f"\nPrompt: {item['prompt']}")
+    print(f"Chosen: {item['chosen'][:100]}...")
+    print(f"Rejected: {item['rejected'][:100]}...")
+    print("Are these clearly different? Is chosen actually better?")
+
+# Check beta
+print(f"Beta: {config.beta}")
+# If > 0.3, may be too conservative
+
+# Check if SFT was good enough
+# Maybe preferences aren't providing new signal
+```
+
+**Solutions:**
+1. Decrease beta for more aggressive learning: 0.2 → 0.05
+2. Increase learning rate slightly: 5e-7 → 8e-7
+3. Verify preference data quality (maybe chosen isn't actually better)
+4. Check if dataset is too ambiguous (high inter-annotator disagreement)
+5. Try training longer (more steps or epochs)
+6. Use different preference dataset with clearer signal
+
+## Best Practices Summary
+
+<CardGrid>
+  <Card title="Data">
+    ✅ Start with 10K-100K high-quality preferences
+
+    ✅ Ensure chosen is clearly better than rejected
+
+    ✅ Create proper train/val splits (90/10)
+
+    ✅ Inspect samples before training
+
+    ✅ Check for duplicates and contradictions
+  </Card>
+
+  <Card title="Training">
+    ✅ Always start from SFT, never base model
+
+    ✅ Use β=0.1 as default, adjust based on results
+
+    ✅ Use learning rate 10x lower than SFT
+
+    ✅ Train for 1 epoch, 2-3 max
+
+    ✅ Monitor KL divergence carefully
+  </Card>
+
+  <Card title="Evaluation">
+    ✅ Check both automatic metrics and generations
+
+    ✅ Compare with SFT baseline
+
+    ✅ Do periodic human evaluation
+
+    ✅ Watch for overfitting (train/val gap)
+
+    ✅ Verify generations stay coherent
+  </Card>
+
+  <Card title="Efficiency">
+    ✅ Use LoRA (rank=16) for memory savings
+
+    ✅ Use gradient accumulation for larger effective batch
+
+    ✅ Use mixed precision (bf16) if available
+
+    ✅ Reference model can be fp16 (inference only)
+
+    ✅ Save checkpoints periodically
+  </Card>
+</CardGrid>
+
+## Complete Training Script
+
+Here's a complete, production-ready training script:
+
+```python
+#!/usr/bin/env python3
+"""
+Complete DPO training script.
+"""
+
+import torch
+from datasets import load_dataset
+from pathlib import Path
+from src.auto_bot_tuner.dpo import (
+    DPOTrainer,
+    DPOConfig,
+    PreferenceDataset,
+    create_reference_model,
+    validate_preference_dataset
+)
+from src.auto_bot_tuner.utils.model_loading import load_model_and_tokenizer
+
+def main():
+    # Configuration
+    sft_model_path = "checkpoints/sft/final"  # Your SFT model
+    dataset_name = "Anthropic/hh-rlhf"
+    output_dir = "checkpoints/dpo"
+    max_samples = 50000  # Limit for faster training
+
+    # 1. Load SFT model
+    print("Loading SFT model...")
+    policy_model, tokenizer, device = load_model_and_tokenizer(
+        sft_model_path,
+        use_lora=True,
+        lora_r=16,
+        lora_alpha=32
+    )
+    print(f"Loaded on {device}")
+
+    # 2. Create reference model
+    print("Creating reference model...")
+    reference_model = create_reference_model(policy_model, device)
+    reference_model = reference_model.bfloat16()  # Save memory
+    print("Reference model created")
+
+    # 3. Load and prepare data
+    print(f"Loading dataset: {dataset_name}...")
+    raw_data = load_dataset(dataset_name, split="train")
+
+    # Validate format
+    validate_preference_dataset(raw_data)
+
+    # Limit size for faster training
+    if max_samples and len(raw_data) > max_samples:
+        raw_data = raw_data.select(range(max_samples))
+
+    # Train/val split
+    raw_split = raw_data.train_test_split(test_size=0.1, seed=42)
+    train_data = raw_split["train"]
+    val_data = raw_split["test"]
+
+    # Create datasets
+    train_dataset = PreferenceDataset(
+        train_data,
+        tokenizer,
+        max_length=512,
+        max_prompt_length=256
+    )
+    val_dataset = PreferenceDataset(
+        val_data,
+        tokenizer,
+        max_length=512,
+        max_prompt_length=256
+    )
+
+    print(f"Training samples: {len(train_dataset)}")
+    print(f"Validation samples: {len(val_dataset)}")
+
+    # 4. Configure training
+    config = DPOConfig(
+        beta=0.1,
+        label_smoothing=0.0,
+        learning_rate=5e-7,
+        batch_size=4,
+        gradient_accumulation_steps=4,
+        num_epochs=1,
+        warmup_steps=50,
+        max_grad_norm=1.0,
+        logging_steps=10,
+        eval_steps=500,
+        save_steps=500,
+        save_total_limit=3,
+        output_dir=output_dir,
+        bf16=torch.cuda.is_available(),  # Use bf16 if available
+        seed=42
+    )
+
+    # 5. Create trainer
+    print("Initializing trainer...")
+    trainer = DPOTrainer(
+        policy_model=policy_model,
+        reference_model=reference_model,
+        tokenizer=tokenizer,
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
+        config=config
+    )
+
+    # 6. Train!
+    print("Starting training...")
+    results = trainer.train()
+
+    # 7. Results
+    print("\n" + "="*60)
+    print("Training completed!")
+    print("="*60)
+    print(f"Total steps: {results['total_steps']}")
+    print(f"Epochs: {results['epochs_completed']}")
+    if results['best_eval_accuracy']:
+        print(f"Best validation accuracy: {results['best_eval_accuracy']:.3f}")
+
+    print(f"\nModel saved to: {Path(output_dir) / 'final'}")
+
+    # 8. Generate sample
+    print("\n" + "="*60)
+    print("Sample generation:")
+    print("="*60)
+
+    test_prompt = "Explain the benefits of exercise."
+    inputs = tokenizer(test_prompt, return_tensors="pt").to(device)
+    outputs = policy_model.generate(
+        **inputs,
+        max_length=200,
+        do_sample=True,
+        temperature=0.7,
+        top_p=0.9
+    )
+    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+    print(f"\nPrompt: {test_prompt}")
+    print(f"\nResponse: {response}")
+
+if __name__ == "__main__":
+    main()
+```
+
+**Run with:**
+```bash
+python train_dpo.py
+```
+
+## Next Steps
+
+Congratulations! You now understand the complete DPO training procedure.
+
+**Continue learning:**
+1. **[DPO Loss Function](/dpo/loss/)** - Deep dive into the mathematics
+2. **[DPO vs RLHF](/dpo/vs-rlhf/)** - Understand when to use each
+3. **[Preference Data](/reward/preference-data/)** - How to collect better preferences
+
+**Advanced topics:**
+- Multi-objective DPO (combining multiple preference signals)
+- Iterative DPO (collect preferences from current policy)
+- DPO variants (IPO, KTO, RRHF)
+- Online DPO (learning from deployed model)
+
+Happy training! 🚀

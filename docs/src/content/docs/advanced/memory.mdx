@@ -1,0 +1,1039 @@
+---
+title: Memory Optimization
+description: Advanced techniques for training large models on limited hardware
+---
+
+import { Aside, Card, CardGrid, Tabs, TabItem } from '@astrojs/starlight/components';
+
+## The Memory Challenge
+
+Training large language models requires substantial GPU memory. Understanding and optimizing memory usage is crucial for:
+
+- **Fitting larger models** on your hardware
+- **Using larger batch sizes** for more stable training
+- **Faster training** through better GPU utilization
+- **Cost reduction** by using smaller/cheaper GPUs
+
+### Memory Breakdown
+
+During training, GPU memory is consumed by:
+
+```
+Total GPU Memory Usage:
+├── Model Weights        (~25-30%)
+├── Optimizer State      (~50-60%)  ← Largest component!
+├── Gradients            (~25-30%)
+├── Activations          (~10-20%)  ← Depends on batch size
+└── Framework Overhead   (~5%)
+```
+
+**Example: GPT-2 (124M parameters) full fine-tuning**
+
+```
+Model weights (fp32):     124M × 4 bytes = 496 MB
+Optimizer (AdamW):        124M × 8 bytes = 992 MB  (momentum + variance)
+Gradients (fp32):         124M × 4 bytes = 496 MB
+Activations (batch=8):                    ~500 MB
+Framework overhead:                       ~100 MB
+────────────────────────────────────────────────
+Total:                                    ~2.6 GB
+```
+
+**Example: Llama 7B full fine-tuning**
+
+```
+Model weights (fp32):     7B × 4 bytes = 28 GB
+Optimizer (AdamW):        7B × 8 bytes = 56 GB
+Gradients (fp32):         7B × 4 bytes = 28 GB
+Activations (batch=8):                   ~20 GB
+Framework overhead:                      ~2 GB
+────────────────────────────────────────────────
+Total:                                   ~134 GB  ← Won't fit on consumer GPUs!
+```
+
+<Aside type="caution">
+The optimizer state is typically the largest memory consumer, often requiring 2x the model size for AdamW!
+</Aside>
+
+## Technique 1: Mixed Precision Training
+
+**Most impactful technique** - Reduces memory by 50% with minimal code changes.
+
+### FP16 vs BF16 vs FP32
+
+<Tabs>
+  <TabItem label="FP32 (Full Precision)">
+**Format:** 1 sign bit, 8 exponent, 23 mantissa
+
+**Range:** ±3.4 × 10^38
+
+**Precision:** ~7 decimal digits
+
+**Memory:** 4 bytes per parameter
+
+**Pros:**
+
+- Maximum numerical stability
+- No special handling needed
+
+**Cons:**
+
+- 2x more memory than FP16/BF16
+- Slower computation
+</TabItem>
+
+  <TabItem label="FP16 (Half Precision)">
+**Format:** 1 sign bit, 5 exponent, 10 mantissa
+
+**Range:** ±65,504
+
+**Precision:** ~3 decimal digits
+
+**Memory:** 2 bytes per parameter
+
+**Pros:**
+
+- 50% memory reduction
+- 2-3x faster on modern GPUs
+- Well-supported (since 2017)
+
+**Cons:**
+
+- Limited range (gradients can overflow/underflow)
+- Requires loss scaling
+- Numerical instability possible
+</TabItem>
+
+  <TabItem label="BF16 (Brain Float)">
+**Format:** 1 sign bit, 8 exponent, 7 mantissa
+
+**Range:** ±3.4 × 10^38 (same as FP32!)
+
+**Precision:** ~2 decimal digits
+
+**Memory:** 2 bytes per parameter
+
+**Pros:**
+
+- 50% memory reduction
+- Same range as FP32 (no overflow issues)
+- No loss scaling needed
+- More stable than FP16
+
+**Cons:**
+
+- Requires newer GPUs (Ampere/Ada for NVIDIA, RDNA3 for AMD)
+- Slightly lower precision than FP16
+</TabItem>
+</Tabs>
+
+### Implementation
+
+**Automatic Mixed Precision (AMP) in PyTorch:**
+
+```python
+import torch
+from torch.cuda.amp import autocast, GradScaler
+
+# Initialize gradient scaler (for FP16 only, not needed for BF16)
+scaler = GradScaler()
+
+for batch in dataloader:
+    optimizer.zero_grad()
+
+    # Forward pass in mixed precision
+    with autocast(dtype=torch.bfloat16):  # or torch.float16
+        outputs = model(batch["input_ids"])
+        loss = compute_loss(outputs, batch["labels"])
+
+    # Backward pass
+    scaler.scale(loss).backward()  # Scale loss to prevent underflow
+
+    # Optimizer step with unscaling
+    scaler.step(optimizer)
+    scaler.update()
+```
+
+**With our codebase:**
+
+From `/home/user/autotune/src/auto_bot_tuner/utils/model_loading.py:183-279`:
+
+```python
+model = AutoModelForCausalLM.from_pretrained(
+    model_path,
+    torch_dtype=torch.bfloat16,  # Load model in BF16!
+    device_map="auto",
+    low_cpu_mem_usage=True,
+)
+```
+
+**Configuration in training:**
+
+```python
+from src.auto_bot_tuner.sft import SFTConfig, SFTTrainer
+
+config = SFTConfig(
+    learning_rate=3e-4,
+    batch_size=8,
+    # Mixed precision is handled automatically when model is loaded in bfloat16
+)
+```
+
+### Memory Savings
+
+**GPT-2 (124M params):**
+```
+FP32: 496 MB (model) + 992 MB (optimizer) + 496 MB (gradients) = 1,984 MB
+BF16: 248 MB (model) + 496 MB (optimizer) + 248 MB (gradients) = 992 MB
+Savings: 50% reduction (1,984 MB → 992 MB)
+```
+
+**Llama 7B:**
+```
+FP32: 28 GB (model) + 56 GB (optimizer) + 28 GB (gradients) = 112 GB
+BF16: 14 GB (model) + 28 GB (optimizer) + 14 GB (gradients) = 56 GB
+Savings: 50% reduction (112 GB → 56 GB)
+```
+
+<Aside type="tip">
+**Which to use?**
+- **BF16:** Preferred for Ampere/Ada GPUs (RTX 30xx, 40xx, A100, H100)
+- **FP16:** Use on older GPUs (RTX 20xx, V100)
+- **FP32:** Only if experiencing numerical issues
+</Aside>
+
+## Technique 2: LoRA (Low-Rank Adaptation)
+
+**Dramatic memory reduction** by training only a tiny fraction of parameters.
+
+### Memory Savings with LoRA
+
+Instead of training all model weights, LoRA adds small trainable matrices:
+
+```
+Full Fine-Tuning:
+  Trainable params: 7,000,000,000
+  Optimizer state:  56 GB
+
+LoRA (r=16):
+  Trainable params: 16,777,216  (0.24% of model!)
+  Optimizer state:  134 MB      (418x reduction!)
+```
+
+**Llama 7B memory comparison:**
+
+```
+Full Fine-Tuning (BF16):
+  Model:      14 GB (trainable)
+  Optimizer:  56 GB
+  Gradients:  14 GB
+  Total:      84 GB + activations
+
+LoRA (BF16, r=16):
+  Model:      14 GB (frozen, can be quantized)
+  LoRA:       67 MB (trainable)
+  Optimizer:  268 MB (only for LoRA)
+  Gradients:  67 MB (only for LoRA)
+  Total:      14.4 GB + activations (5.8x reduction!)
+```
+
+### Implementation
+
+See our [LoRA documentation](/sft/lora/) for details, but here's the key configuration:
+
+```python
+from src.auto_bot_tuner.utils.model_loading import load_model_and_tokenizer
+
+# Automatically sets up LoRA with sensible defaults
+model, tokenizer, device = load_model_and_tokenizer(
+    "meta-llama/Llama-3.2-1B",
+    use_lora=True  # Adds LoRA adapters
+)
+
+# Result: Only 0.24% of parameters are trainable!
+# Trainable parameters: 16,777,216 (0.24% of total)
+```
+
+**Rank selection for memory:**
+
+```python
+Memory usage ≈ r × (d_model × num_layers × 2)
+
+r=4:   ~33 MB (minimum, may underfit)
+r=8:   ~67 MB (good for simple tasks)
+r=16:  ~134 MB (default, recommended)
+r=32:  ~268 MB (high capacity)
+r=64:  ~536 MB (rarely needed)
+```
+
+<Aside type="tip">
+LoRA is the single most effective technique for memory reduction. Start here!
+</Aside>
+
+## Technique 3: Gradient Accumulation
+
+**Simulate larger batch sizes** without additional memory.
+
+### How It Works
+
+Instead of updating weights every batch, accumulate gradients over multiple batches:
+
+```python
+# Effective batch size = batch_size × gradient_accumulation_steps
+effective_batch_size = 8 × 4 = 32
+
+# Memory usage = batch_size (not effective_batch_size!)
+memory_usage ≈ batch_size_per_step = 8
+```
+
+**Process:**
+
+```
+Step 1: Forward + Backward (batch 1)  → Accumulate gradients
+Step 2: Forward + Backward (batch 2)  → Accumulate gradients
+Step 3: Forward + Backward (batch 3)  → Accumulate gradients
+Step 4: Forward + Backward (batch 4)  → Accumulate gradients
+Step 5: Optimizer step                → Update weights, zero gradients
+```
+
+### Implementation
+
+```python
+from src.auto_bot_tuner.sft import SFTConfig, SFTTrainer
+
+config = SFTConfig(
+    batch_size=4,                      # Physical batch size (fits in memory)
+    gradient_accumulation_steps=8,     # Accumulate over 8 steps
+    # Effective batch size = 4 × 8 = 32
+)
+
+trainer = SFTTrainer(model=model, config=config, ...)
+trainer.train()
+```
+
+**Manual implementation:**
+
+```python
+accumulation_steps = 4
+optimizer.zero_grad()
+
+for i, batch in enumerate(dataloader):
+    # Forward pass
+    outputs = model(batch["input_ids"])
+    loss = compute_loss(outputs, batch["labels"])
+
+    # Scale loss by accumulation steps
+    loss = loss / accumulation_steps
+
+    # Backward pass (accumulates gradients)
+    loss.backward()
+
+    # Update weights every accumulation_steps
+    if (i + 1) % accumulation_steps == 0:
+        optimizer.step()
+        optimizer.zero_grad()
+```
+
+### Trade-offs
+
+**Pros:**
+- Train with large effective batch sizes
+- More stable gradients
+- No additional memory cost
+
+**Cons:**
+- Slower training (more forward/backward passes per update)
+- Gradients accumulate in FP32 (slight memory overhead)
+
+**When to use:**
+- Batch size limited by memory
+- Want stable training with large batches
+- Acceptable to trade speed for memory
+
+<Aside type="note">
+Gradient accumulation does NOT save memory for the optimizer state. It only allows larger effective batch sizes.
+</Aside>
+
+## Technique 4: Gradient Checkpointing
+
+**Trade computation for memory** by recomputing activations during backward pass.
+
+### How It Works
+
+Normally, PyTorch saves all intermediate activations during forward pass for use in backward pass:
+
+```
+Without Gradient Checkpointing:
+  Forward:  Save all activations → High memory
+  Backward: Use saved activations → Fast
+
+With Gradient Checkpointing:
+  Forward:  Save only checkpoint activations → Low memory
+  Backward: Recompute from checkpoints → Slower, low memory
+```
+
+**Memory savings:**
+
+```
+Activation memory ≈ batch_size × seq_length × hidden_size × num_layers
+
+Without checkpointing: Store all layer activations
+With checkpointing:    Store only checkpointed layers (typically every 2-4 layers)
+
+Reduction: 50-80% of activation memory
+```
+
+### Implementation
+
+**With Hugging Face models:**
+
+```python
+from transformers import AutoModelForCausalLM
+
+model = AutoModelForCausalLM.from_pretrained("gpt2")
+
+# Enable gradient checkpointing
+model.gradient_checkpointing_enable()
+
+# Train normally - checkpointing is automatic
+trainer.train()
+```
+
+**Manual implementation (PyTorch):**
+
+```python
+from torch.utils.checkpoint import checkpoint
+
+class TransformerWithCheckpointing(nn.Module):
+    def forward(self, x):
+        # Checkpoint every 2 layers
+        for i, layer in enumerate(self.layers):
+            if i % 2 == 0:
+                # Use checkpointing
+                x = checkpoint(layer, x, use_reentrant=False)
+            else:
+                # Normal forward pass
+                x = layer(x)
+        return x
+```
+
+### Memory Savings
+
+**Llama 7B training (batch_size=8, seq_length=2048):**
+
+```
+Activation memory without checkpointing: ~20 GB
+Activation memory with checkpointing:    ~5 GB
+Savings: 75% reduction in activation memory
+```
+
+**Total memory impact:**
+
+```
+Without checkpointing:
+  Model (BF16):       14 GB
+  LoRA optimizer:     268 MB
+  LoRA gradients:     67 MB
+  Activations:        20 GB
+  Total:              34.3 GB
+
+With checkpointing:
+  Model (BF16):       14 GB
+  LoRA optimizer:     268 MB
+  LoRA gradients:     67 MB
+  Activations:        5 GB
+  Total:              19.3 GB (43% reduction!)
+```
+
+### Trade-offs
+
+**Pros:**
+- Significant activation memory reduction (50-80%)
+- No loss in model quality
+- Transparent to training code
+
+**Cons:**
+- 20-30% slower training (recomputation overhead)
+- More GPU utilization (recomputing activations)
+
+**When to use:**
+- Hitting OOM errors due to activations
+- Training with long sequences
+- Want to increase batch size
+
+## Technique 5: Batch Size Optimization
+
+**Find the optimal batch size** for your memory constraints.
+
+### Batch Size Formula
+
+Estimate maximum batch size:
+
+```
+Available GPU Memory = Model + Optimizer + Gradients + (Activations × batch_size)
+
+Max Batch Size ≈ (Available_Memory - Fixed_Costs) / Activation_Per_Sample
+```
+
+**Example calculation (RTX 3090, 24 GB, Llama 7B + LoRA):**
+
+```
+Available memory:        24 GB
+Model (BF16):           -14 GB
+LoRA optimizer/grads:   -0.4 GB
+Framework overhead:     -1 GB
+──────────────────────────────
+Available for activations: 8.6 GB
+
+Activation per sample (seq_len=512):  ~300 MB
+Max batch size: 8.6 GB / 300 MB ≈ 28 samples
+
+Practical batch size: 16-24 (leave headroom for peak usage)
+```
+
+### Finding Your Optimal Batch Size
+
+**Binary search approach:**
+
+```python
+def find_max_batch_size(model, dataset, min_bs=1, max_bs=128):
+    """Binary search to find maximum batch size that fits in memory."""
+
+    while min_bs < max_bs:
+        bs = (min_bs + max_bs + 1) // 2
+
+        try:
+            # Try training with this batch size
+            config = SFTConfig(batch_size=bs, num_epochs=0.01)
+            trainer = SFTTrainer(model=model, config=config, ...)
+            trainer.train()
+
+            # Success! Try larger
+            print(f"✓ Batch size {bs} fits")
+            min_bs = bs
+
+        except torch.cuda.OutOfMemoryError:
+            # OOM! Try smaller
+            print(f"✗ Batch size {bs} OOM")
+            max_bs = bs - 1
+            torch.cuda.empty_cache()
+
+    return min_bs
+
+# Find maximum batch size
+max_bs = find_max_batch_size(model, dataset)
+print(f"Maximum batch size: {max_bs}")
+
+# Use 80% of maximum for safety
+practical_bs = int(max_bs * 0.8)
+```
+
+### Batch Size Guidelines
+
+**Model-specific recommendations:**
+
+| Model | Memory | LoRA r=16 | Full FT |
+|-------|--------|-----------|---------|
+| **GPT-2 (124M)** | 8 GB | 32-64 | 16-32 |
+| **GPT-2 (124M)** | 24 GB | 128+ | 64-128 |
+| **Llama 1B** | 8 GB | 4-8 | N/A |
+| **Llama 1B** | 24 GB | 16-32 | 4-8 |
+| **Llama 7B** | 24 GB | 8-16 | N/A |
+| **Llama 7B** | 40 GB | 24-32 | 2-4 |
+| **Llama 7B** | 80 GB | 64+ | 8-16 |
+
+<Aside type="note">
+These are for sequence length 512. Longer sequences require proportionally smaller batches.
+</Aside>
+
+## Technique 6: Model Quantization
+
+**Load models in reduced precision** (4-bit or 8-bit) to dramatically reduce memory.
+
+### Quantization Levels
+
+<CardGrid>
+  <Card title="8-bit Quantization">
+**Memory:** 50% of FP16 (25% of FP32)
+
+**Quality:** ~99% of FP16 performance
+
+**Speed:** Slightly slower than FP16
+
+**Use case:** Production inference, training frozen base models
+  </Card>
+
+  <Card title="4-bit Quantization">
+**Memory:** 25% of FP16 (12.5% of FP32)
+
+**Quality:** ~95-98% of FP16 performance
+
+**Speed:** Slower than 8-bit
+
+**Use case:** Large models on limited hardware
+  </Card>
+</CardGrid>
+
+### Implementation with bitsandbytes
+
+**8-bit quantization:**
+
+```python
+from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+
+# Configure 8-bit quantization
+quantization_config = BitsAndBytesConfig(
+    load_in_8bit=True,
+    llm_int8_threshold=6.0,  # Outlier threshold
+)
+
+# Load model in 8-bit
+model = AutoModelForCausalLM.from_pretrained(
+    "meta-llama/Llama-3.2-7B",
+    quantization_config=quantization_config,
+    device_map="auto",
+)
+
+# Add LoRA on top (LoRA adapters stay in FP16/BF16)
+from peft import LoraConfig, get_peft_model
+
+lora_config = LoraConfig(r=16, lora_alpha=32, ...)
+model = get_peft_model(model, lora_config)
+
+# Train normally!
+```
+
+**4-bit quantization (QLoRA):**
+
+```python
+# Configure 4-bit quantization with NF4
+quantization_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",        # NormalFloat4 (better than standard)
+    bnb_4bit_use_double_quant=True,   # Double quantization for more savings
+    bnb_4bit_compute_dtype=torch.bfloat16,  # Computation dtype
+)
+
+model = AutoModelForCausalLM.from_pretrained(
+    "meta-llama/Llama-3.2-7B",
+    quantization_config=quantization_config,
+    device_map="auto",
+)
+
+# Add LoRA (required for 4-bit training)
+model = get_peft_model(model, lora_config)
+```
+
+### Memory Savings
+
+**Llama 7B without quantization:**
+```
+FP32: 28 GB
+BF16: 14 GB
+```
+
+**Llama 7B with quantization:**
+```
+8-bit: 7 GB    (50% reduction from BF16)
+4-bit: 3.5 GB  (75% reduction from BF16)
+```
+
+**Complete training setup (Llama 7B + QLoRA):**
+
+```
+Model (4-bit):          3.5 GB
+LoRA adapters (BF16):   67 MB
+Optimizer state:        268 MB
+Gradients:              67 MB
+Activations (bs=8):     5 GB (with checkpointing)
+──────────────────────────────
+Total:                  ~9 GB (fits on RTX 3080!)
+```
+
+<Aside type="tip">
+**QLoRA = 4-bit quantization + LoRA** enables training 7B models on consumer GPUs!
+</Aside>
+
+### Quality Considerations
+
+**Quantization impact on performance:**
+
+| Precision | Relative Quality | Use Case |
+|-----------|-----------------|----------|
+| FP32 | 100% (baseline) | Research, numerical sensitivity |
+| BF16 | 99.9% | Standard training |
+| FP16 | 99.8% | Older GPUs |
+| 8-bit | 99% | Memory-constrained training |
+| 4-bit (NF4) | 95-98% | Ultra-low memory (QLoRA) |
+
+## Technique 7: CPU Offloading
+
+**Offload optimizer state to CPU** to reduce GPU memory usage.
+
+### How It Works
+
+Keep model on GPU for fast computation, but store optimizer state on CPU:
+
+```
+GPU:
+  - Model weights (needed for forward/backward)
+  - Gradients (needed for backward)
+  - Activations (needed for backward)
+
+CPU:
+  - Optimizer state (momentum, variance)
+```
+
+**Transfer overhead:**
+```
+After backward pass:
+  1. Copy gradients to CPU (~100 ms)
+  2. Optimizer step on CPU (~200 ms)
+  3. Copy updated weights to GPU (~100 ms)
+
+Total overhead: ~400 ms per step
+```
+
+### Implementation with DeepSpeed
+
+```python
+from deepspeed import initialize
+
+# DeepSpeed configuration
+ds_config = {
+    "train_batch_size": 8,
+    "gradient_accumulation_steps": 1,
+    "optimizer": {
+        "type": "AdamW",
+        "params": {
+            "lr": 3e-4,
+        }
+    },
+    "zero_optimization": {
+        "stage": 2,  # Offload optimizer state
+        "offload_optimizer": {
+            "device": "cpu",
+            "pin_memory": True  # Faster transfers
+        }
+    },
+    "fp16": {
+        "enabled": True
+    }
+}
+
+# Initialize with DeepSpeed
+model_engine, optimizer, _, _ = initialize(
+    model=model,
+    model_parameters=model.parameters(),
+    config=ds_config
+)
+
+# Train normally
+for batch in dataloader:
+    loss = model_engine(batch)
+    model_engine.backward(loss)
+    model_engine.step()
+```
+
+### Memory Savings
+
+**Llama 7B with LoRA:**
+
+```
+Without CPU offloading:
+  Model (GPU):          14 GB
+  Optimizer (GPU):      268 MB
+  Gradients (GPU):      67 MB
+  Activations (GPU):    5 GB
+  Total GPU:            19.3 GB
+
+With CPU offloading:
+  Model (GPU):          14 GB
+  Optimizer (CPU):      268 MB ← Offloaded!
+  Gradients (GPU):      67 MB
+  Activations (GPU):    5 GB
+  Total GPU:            19 GB (minimal savings for LoRA)
+
+  # But for full fine-tuning:
+  Total GPU without:    84 GB
+  Total GPU with:       28 GB (67% reduction!)
+```
+
+### Trade-offs
+
+**Pros:**
+- Significant memory savings for full fine-tuning
+- Enables training larger models
+
+**Cons:**
+- 2-3x slower training (CPU-GPU transfers)
+- Requires fast CPU and RAM
+- Diminishing returns with LoRA (optimizer already small)
+
+**When to use:**
+- Full fine-tuning on memory-limited GPUs
+- Optimizer state won't fit in GPU memory
+- Have fast CPU (many cores) and ample RAM
+
+## Technique 8: Memory Profiling
+
+**Understand where your memory is going** to optimize effectively.
+
+### PyTorch Memory Profiler
+
+```python
+import torch
+
+# Track memory allocations
+torch.cuda.reset_peak_memory_stats()
+
+# Run training step
+outputs = model(input_ids)
+loss = compute_loss(outputs, labels)
+loss.backward()
+
+# Print memory stats
+print(f"Allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+print(f"Reserved:  {torch.cuda.memory_reserved() / 1e9:.2f} GB")
+print(f"Peak:      {torch.cuda.max_memory_allocated() / 1e9:.2f} GB")
+
+# Detailed memory snapshot
+torch.cuda.memory_summary()
+```
+
+### Finding Memory Leaks
+
+```python
+import gc
+
+def profile_memory(fn, label=""):
+    """Profile memory usage of a function."""
+    torch.cuda.reset_peak_memory_stats()
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    start_mem = torch.cuda.memory_allocated()
+
+    result = fn()
+
+    end_mem = torch.cuda.memory_allocated()
+    peak_mem = torch.cuda.max_memory_allocated()
+
+    print(f"\n{label}")
+    print(f"  Start: {start_mem / 1e9:.2f} GB")
+    print(f"  End:   {end_mem / 1e9:.2f} GB")
+    print(f"  Delta: {(end_mem - start_mem) / 1e9:.2f} GB")
+    print(f"  Peak:  {peak_mem / 1e9:.2f} GB")
+
+    return result
+
+# Profile each component
+profile_memory(lambda: model.forward(batch), "Forward pass")
+profile_memory(lambda: loss.backward(), "Backward pass")
+profile_memory(lambda: optimizer.step(), "Optimizer step")
+```
+
+### nvidia-smi Monitoring
+
+```bash
+# Watch GPU memory in real-time
+watch -n 1 nvidia-smi
+
+# Log memory usage to file
+nvidia-smi --query-gpu=timestamp,memory.used,memory.total --format=csv --loop=1 > memory_log.csv
+```
+
+## Debugging Out-of-Memory Errors
+
+<Aside type="caution">
+**Out-of-Memory (OOM)** errors are the most common issue in LLM training. Here's how to debug them.
+</Aside>
+
+### OOM Debugging Checklist
+
+**1. Check current memory usage:**
+
+```bash
+nvidia-smi
+# Look at memory usage before crash
+```
+
+**2. Reduce batch size by 50%:**
+
+```python
+# If batch_size=8 caused OOM, try 4
+config = SFTConfig(batch_size=4, ...)
+```
+
+**3. Enable gradient checkpointing:**
+
+```python
+model.gradient_checkpointing_enable()
+```
+
+**4. Use gradient accumulation:**
+
+```python
+config = SFTConfig(
+    batch_size=2,                    # Small physical batch
+    gradient_accumulation_steps=4,   # Accumulate to effective batch=8
+)
+```
+
+**5. Check for memory leaks:**
+
+```python
+# Are you accidentally storing tensors?
+# Bad:
+self.all_losses.append(loss)  # Stores computation graph!
+
+# Good:
+self.all_losses.append(loss.item())  # Only stores scalar
+```
+
+**6. Clear cache between runs:**
+
+```python
+import torch
+torch.cuda.empty_cache()
+```
+
+### Common OOM Causes
+
+| Cause | Solution |
+|-------|----------|
+| Batch size too large | Reduce by 50%, use gradient accumulation |
+| Sequence length too long | Truncate to 512 or 1024 tokens |
+| Accumulating tensors | Use `.item()` or `.detach()` |
+| Fragmented memory | `torch.cuda.empty_cache()` |
+| Multiple models in memory | Delete unused models |
+| No gradient checkpointing | Enable checkpointing |
+| Full precision training | Use BF16/FP16 |
+
+## Memory Optimization Strategy
+
+**Recommended approach for maximizing efficiency:**
+
+### Step 1: Start with Essentials
+```python
+# Essential optimizations (apply always)
+1. Mixed precision (BF16/FP16)
+2. LoRA (if training large models)
+3. Batch size = find_max_batch_size()
+```
+
+### Step 2: Add If Needed
+```python
+# If still hitting OOM:
+4. Gradient checkpointing
+5. Gradient accumulation
+```
+
+### Step 3: Advanced Techniques
+```python
+# For extreme memory constraints:
+6. 4-bit quantization (QLoRA)
+7. CPU offloading (DeepSpeed)
+```
+
+### Example Configurations
+
+**RTX 3090 (24 GB) - Llama 7B:**
+
+```python
+# Configuration 1: Maximum speed
+model, tokenizer, device = load_model_and_tokenizer(
+    "meta-llama/Llama-3.2-7B",
+    use_lora=True  # LoRA r=16
+)
+config = SFTConfig(
+    batch_size=16,
+    gradient_accumulation_steps=1,
+    # Uses: BF16 + LoRA
+)
+# Memory: ~20 GB
+# Speed: Fast
+```
+
+```python
+# Configuration 2: Maximum memory efficiency
+quantization_config = BitsAndBytesConfig(load_in_4bit=True, ...)
+model = AutoModelForCausalLM.from_pretrained(
+    "meta-llama/Llama-3.2-7B",
+    quantization_config=quantization_config
+)
+model.gradient_checkpointing_enable()
+config = SFTConfig(
+    batch_size=8,
+    gradient_accumulation_steps=4,
+    # Uses: 4-bit + LoRA + Checkpointing + Gradient Accumulation
+)
+# Memory: ~12 GB
+# Speed: Slower (but fits!)
+```
+
+## Summary
+
+**Memory Optimization Techniques Ranked:**
+
+| Technique | Memory Savings | Speed Impact | Complexity | When to Use |
+|-----------|----------------|--------------|------------|-------------|
+| **Mixed Precision** | 50% | +20% faster | Low | Always |
+| **LoRA** | 80-95% optimizer | None | Low | Large models |
+| **Gradient Accumulation** | 0% (enables larger effective batch) | -20-30% | Low | Memory-limited batch |
+| **Gradient Checkpointing** | 50-80% activations | -20-30% | Low | Long sequences |
+| **Batch Size Optimization** | Variable | Variable | Low | Always |
+| **Quantization (4-bit)** | 75% model | -10-20% | Medium | Extreme constraints |
+| **CPU Offloading** | 50-70% optimizer | -60-80% | High | Last resort |
+
+**Recommended Stack:**
+
+```python
+# Optimal for most scenarios (24 GB GPU, 7B model)
+1. BF16 mixed precision     ← Always
+2. LoRA (r=16)              ← Large models
+3. Gradient checkpointing    ← If needed
+4. Batch size optimization   ← Always
+5. Gradient accumulation     ← If needed
+
+# Result: 7B model trainable on 24 GB GPU!
+```
+
+**Quick Reference:**
+
+```python
+# Full optimization example
+from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+from peft import LoraConfig, get_peft_model
+
+# 4-bit quantization + LoRA
+quantization_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.bfloat16
+)
+
+model = AutoModelForCausalLM.from_pretrained(
+    "meta-llama/Llama-3.2-7B",
+    quantization_config=quantization_config,
+    device_map="auto"
+)
+
+# LoRA
+lora_config = LoraConfig(r=16, lora_alpha=32, ...)
+model = get_peft_model(model, lora_config)
+
+# Gradient checkpointing
+model.gradient_checkpointing_enable()
+
+# Training config
+config = SFTConfig(
+    batch_size=4,                    # Small batch
+    gradient_accumulation_steps=8,   # Effective batch = 32
+    learning_rate=3e-4,
+)
+
+# Result: 7B model on 12 GB GPU!
+```
+
+With these techniques, you can train models much larger than your GPU memory would normally allow!

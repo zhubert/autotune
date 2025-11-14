@@ -1,0 +1,607 @@
+---
+title: Loss Masking
+description: Understanding why and how we mask prompt tokens during SFT training
+---
+
+import { Aside, Card, Tabs, TabItem } from '@astrojs/starlight/components';
+
+## The Core Problem
+
+Consider training a model on this example:
+
+```
+### Instruction:
+What is the capital of France?
+
+### Response:
+The capital of France is Paris.
+```
+
+If we compute loss on **every token**, the model learns two things simultaneously:
+
+1. How to repeat the prompt verbatim ("### Instruction: What is...")
+2. How to generate the response ("The capital of France is Paris.")
+
+**Problem:** We only want to teach #2, not #1!
+
+<Aside type="caution">
+Training on prompts wastes computation and teaches the model to repeat instructions instead of answering them.
+</Aside>
+
+## Why Mask Prompts?
+
+### 1. Computational Efficiency
+
+Computing loss on prompts is wasted work:
+
+```
+Prompt:   [50 tokens] → Ignored in loss → No learning
+Response: [20 tokens] → Used in loss    → Learning happens
+```
+
+With masking, we focus 100% of training capacity on learning responses.
+
+### 2. Preventing Prompt Memorization
+
+Without masking, the model might learn:
+
+```
+User: What is the capital of France?
+Model: ### Instruction: What is the capital of France?  # Repeating prompt!
+```
+
+With masking, the model learns:
+
+```
+User: What is the capital of France?
+Model: The capital of France is Paris.  # Proper response!
+```
+
+### 3. Task Specification
+
+The prompt is **given context**, not something to generate:
+
+- **Input to the model:** The prompt (instruction + context)
+- **Output from the model:** The response
+- **Training target:** Only the output
+
+<Aside type="note">
+This mirrors how the model will be used: Users provide prompts, model generates responses.
+</Aside>
+
+## How Loss Masking Works
+
+### The Magic Number: -100
+
+PyTorch's `cross_entropy` function has a special parameter:
+
+```python
+ignore_index=-100
+```
+
+Any label with value -100 is **completely ignored** in loss computation.
+
+From `/home/user/autotune/src/auto_bot_tuner/sft/loss.py:58`:
+
+```python
+loss = F.cross_entropy(
+    shift_logits,
+    shift_labels,
+    ignore_index=-100,  # Tokens with label -100 don't contribute to loss
+    reduction=reduction
+)
+```
+
+### Creating Masked Labels
+
+From `/home/user/autotune/src/auto_bot_tuner/sft/dataset.py:90-93`:
+
+```python
+# Create labels: -100 for prompt tokens (ignored), actual tokens for response
+# This ensures we only compute loss on the model's generated responses
+labels = [-100] * len(prompt_ids) + response_ids + [self.tokenizer.eos_token_id]
+labels = labels[:self.max_length]  # Match length after truncation
+```
+
+**Example:**
+
+```python
+# Text: "### Instruction: Summarize this. ### Response: Summary here."
+
+prompt_ids = [101, 102, 103, 104]      # "### Instruction: Summarize this. ### Response:"
+response_ids = [201, 202, 203]         # "Summary here."
+eos_token_id = 50256
+
+# Labels for training:
+labels = [-100, -100, -100, -100,      # Prompt tokens masked
+          201, 202, 203, 50256]        # Response tokens used
+```
+
+The model still **sees** the prompt tokens (they're in `input_ids`), but loss is only computed on response tokens.
+
+## Mathematical Foundation
+
+### Standard Cross-Entropy Loss
+
+For language modeling, we predict the next token at each position:
+
+$$
+\mathcal{L}_{\text{standard}} = -\frac{1}{N} \sum_{i=1}^{N} \log P(y_i | x_1, ..., x_{i-1})
+$$
+
+Where:
+- $N$ = total sequence length
+- $y_i$ = target token at position $i$
+- $P(y_i | x_1, ..., x_{i-1})$ = model's predicted probability for $y_i$
+
+**Problem:** This includes ALL positions, including the prompt.
+
+### Masked Cross-Entropy Loss
+
+With masking, we only sum over response positions:
+
+$$
+\mathcal{L}_{\text{masked}} = -\frac{1}{|R|} \sum_{i \in R} \log P(y_i | x_1, ..., x_{i-1})
+$$
+
+Where:
+- $R$ = set of response token positions (non-masked)
+- $|R|$ = number of response tokens
+
+**Key difference:** The denominator is now $|R|$ (response tokens) instead of $N$ (all tokens).
+
+### Gradient Flow
+
+During backpropagation:
+
+$$
+\frac{\partial \mathcal{L}}{\partial \theta} = -\frac{1}{|R|} \sum_{i \in R} \frac{\partial \log P(y_i | x_{1:i-1})}{\partial \theta}
+$$
+
+**Crucial insight:** Masked positions have $\frac{\partial \mathcal{L}}{\partial y_i} = 0$, so they contribute **zero gradient**.
+
+<Aside type="tip">
+Even though prompt tokens don't contribute to loss, they still influence the model's hidden states, which affect response token predictions!
+</Aside>
+
+## Implementation Deep Dive
+
+### Step 1: Separate Tokenization
+
+From `/home/user/autotune/src/auto_bot_tuner/sft/dataset.py:78-80`:
+
+```python
+# Tokenize prompt and response separately to create proper labels
+prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=True)
+response_ids = self.tokenizer.encode(response, add_special_tokens=False)
+```
+
+**Why separate?** So we know exactly where the prompt ends and response begins.
+
+### Step 2: Build Parallel Arrays
+
+```python
+# Combine tokens
+total_ids = prompt_ids + response_ids + [self.tokenizer.eos_token_id]
+
+# Create labels with masking
+labels = [-100] * len(prompt_ids) + response_ids + [self.tokenizer.eos_token_id]
+```
+
+**Example visualization:**
+
+```
+Position:     0     1     2     3     4     5     6     7
+             [prompt tokens...] [response tokens...]
+input_ids:   [101, 102, 103,   201, 202, 203, 50256]
+labels:      [-100,-100,-100,   201, 202, 203, 50256]
+                 ↑                    ↑
+              Masked             Trained on these
+```
+
+### Step 3: Padding
+
+From `/home/user/autotune/src/auto_bot_tuner/sft/dataset.py:98`:
+
+```python
+labels = labels + [-100] * (self.max_length - len(labels))
+```
+
+**Padding tokens also get -100** because we don't want to train on padding!
+
+```
+Position:     0     1     2     3     4     5     6     7     8
+input_ids:   [101, 102, 201, 202, 203, 50256,   0,    0,    0]  # 0 = pad
+labels:      [-100,-100, 201, 202, 203, 50256,-100, -100, -100]
+                                                 ↑
+                                           Padding masked
+```
+
+### Step 4: Loss Computation
+
+From `/home/user/autotune/src/auto_bot_tuner/sft/loss.py:46-63`:
+
+```python
+# Shift logits and labels for next-token prediction
+# The model predicts token i+1 from tokens 0...i
+shift_logits = logits[..., :-1, :].contiguous()
+shift_labels = labels[..., 1:].contiguous()
+
+# Flatten for cross-entropy computation
+# Shape: (batch_size * seq_len, vocab_size) and (batch_size * seq_len)
+shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+shift_labels = shift_labels.view(-1)
+
+# Compute cross-entropy loss
+# ignore_index=-100 means tokens with label -100 don't contribute to loss
+loss = F.cross_entropy(
+    shift_logits,
+    shift_labels,
+    ignore_index=-100,
+    reduction=reduction
+)
+```
+
+**The shifting is crucial!** We predict position $i+1$ from positions $0$ to $i$.
+
+## Shifting for Next-Token Prediction
+
+Language models are trained on **next-token prediction**:
+
+```
+Given:   "The cat sat on"
+Predict: "the"
+```
+
+### Why Shift?
+
+```
+Original:
+input:  [The] [cat] [sat] [on]  [the]
+labels: [The] [cat] [sat] [on]  [the]
+
+After shifting:
+input:  [The] [cat] [sat] [on]       ← model sees these
+labels:      [cat] [sat] [on]  [the] ← model predicts these
+```
+
+Each input token predicts the **next** token:
+- From "The" → predict "cat"
+- From "cat" → predict "sat"
+- From "sat" → predict "on"
+- From "on" → predict "the"
+
+### Mathematical Notation
+
+$$
+\mathcal{L} = -\sum_{i=0}^{N-1} \log P(x_{i+1} | x_0, ..., x_i)
+$$
+
+The model uses tokens $x_0$ through $x_i$ to predict $x_{i+1}$.
+
+<Aside type="note">
+This is why we have `shift_logits = logits[..., :-1, :]` and `shift_labels = labels[..., 1:]`.
+</Aside>
+
+## Code Example: Complete Flow
+
+Let's trace through a complete example:
+
+```python
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
+import torch.nn.functional as F
+
+# Setup
+tokenizer = AutoTokenizer.from_pretrained("gpt2")
+tokenizer.pad_token = tokenizer.eos_token
+
+# Example data
+prompt = "### Instruction:\nWhat is 2+2?\n\n### Response:\n"
+response = "2+2 equals 4."
+
+# Tokenize
+prompt_ids = tokenizer.encode(prompt, add_special_tokens=True)
+response_ids = tokenizer.encode(response, add_special_tokens=False)
+
+print(f"Prompt tokens: {len(prompt_ids)}")
+print(f"Response tokens: {len(response_ids)}")
+
+# Create input_ids and labels
+input_ids = prompt_ids + response_ids + [tokenizer.eos_token_id]
+labels = [-100] * len(prompt_ids) + response_ids + [tokenizer.eos_token_id]
+
+print(f"\nInput IDs: {input_ids}")
+print(f"Labels:    {labels}")
+print(f"\nMasked positions: {labels.count(-100)}")
+print(f"Training positions: {len([l for l in labels if l != -100])}")
+
+# During training, only non-masked positions contribute to loss!
+```
+
+**Output:**
+```
+Prompt tokens: 15
+Response tokens: 7
+
+Input IDs: [21017, 46486, 25, ..., 17, 10, 17, 21242, 604, 13, 50256]
+Labels:    [-100, -100, -100, ..., 17, 10, 17, 21242, 604, 13, 50256]
+
+Masked positions: 15
+Training positions: 8
+```
+
+Only 8 out of 23 tokens contribute to training - a 65% reduction!
+
+## Computing Metrics on Masked Data
+
+### Token-Level Accuracy
+
+From `/home/user/autotune/src/auto_bot_tuner/sft/loss.py:95-107`:
+
+```python
+# Get predictions
+predictions = shift_logits.argmax(dim=-1)
+
+# Mask out ignored tokens (label = -100)
+mask = (shift_labels != -100)
+correct = (predictions == shift_labels) & mask
+
+# Compute accuracy only on non-masked tokens
+accuracy = correct.sum().float() / mask.sum().float() if mask.sum() > 0 else torch.tensor(0.0)
+num_tokens = mask.sum()
+```
+
+**Key points:**
+1. Get predictions by taking argmax over vocabulary
+2. Create mask for non-ignored labels
+3. Count correct predictions only where mask is True
+4. Divide by number of masked tokens, not total tokens
+
+### Perplexity
+
+From `/home/user/autotune/src/auto_bot_tuner/sft/loss.py:89-92`:
+
+```python
+# Compute perplexity
+# Perplexity is exp(loss) - measures how "surprised" the model is
+# Lower perplexity = better model
+perplexity = torch.exp(loss)
+```
+
+**Perplexity interpretation:**
+
+$$
+\text{Perplexity} = \exp(\mathcal{L}) = \exp\left(-\frac{1}{|R|} \sum_{i \in R} \log P(y_i)\right)
+$$
+
+- Perplexity of 1.0 = perfect model (assigns probability 1.0 to correct tokens)
+- Perplexity of 10 = model is "10-ways confused" on average
+- Perplexity of 1000+ = model is essentially guessing randomly
+
+<Aside type="tip">
+For instruction tuning, good perplexity is typically 10-30. Below 5 may indicate overfitting.
+</Aside>
+
+## Common Pitfalls
+
+### Pitfall 1: Forgetting to Mask Padding
+
+```python
+# Bad - padding tokens contribute to loss!
+labels = prompt_ids + response_ids
+labels = labels + [tokenizer.pad_token_id] * (max_length - len(labels))
+
+# Good - padding tokens are masked
+labels = [-100] * len(prompt_ids) + response_ids
+labels = labels + [-100] * (max_length - len(labels))
+```
+
+**Why it matters:** Training on padding teaches the model to generate pad tokens!
+
+### Pitfall 2: Masking the EOS Token
+
+```python
+# Bad - EOS token is masked
+labels = [-100] * len(prompt_ids) + response_ids + [-100]  # EOS masked!
+
+# Good - EOS token is part of response
+labels = [-100] * len(prompt_ids) + response_ids + [tokenizer.eos_token_id]
+```
+
+**Why it matters:** The model needs to learn when to stop generating!
+
+### Pitfall 3: Incorrect Shifting
+
+```python
+# Bad - not shifting correctly
+loss = F.cross_entropy(logits.view(-1, vocab_size), labels.view(-1))
+
+# Good - shift for next-token prediction
+shift_logits = logits[..., :-1, :].contiguous()
+shift_labels = labels[..., 1:].contiguous()
+loss = F.cross_entropy(shift_logits.view(-1, vocab_size), shift_labels.view(-1))
+```
+
+**Why it matters:** Without shifting, the model can "cheat" by using the current token to predict itself!
+
+### Pitfall 4: All Tokens Masked
+
+From `/home/user/autotune/src/auto_bot_tuner/sft/loss.py:214-216`:
+
+```python
+# Check for non-masked tokens
+num_valid_tokens = (labels != -100).sum().item()
+if num_valid_tokens == 0:
+    raise ValueError("All tokens are masked (label = -100), cannot compute loss")
+```
+
+This can happen if:
+- Response is empty
+- Entire sequence was truncated to just the prompt
+- Masking logic has a bug
+
+**Solution:** Always validate your dataset before training!
+
+## Advanced: Per-Token Loss Analysis
+
+Sometimes you want to see which tokens are hard to predict:
+
+From `/home/user/autotune/src/auto_bot_tuner/sft/loss.py:117-153`:
+
+```python
+def compute_token_level_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor
+) -> torch.Tensor:
+    """
+    Compute per-token loss values (unreduced).
+
+    Useful for identifying which tokens are hard for the model to predict.
+    """
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+
+    batch_size, seq_len, vocab_size = shift_logits.shape
+
+    # Compute unreduced loss
+    flat_logits = shift_logits.view(-1, vocab_size)
+    flat_labels = shift_labels.view(-1)
+
+    flat_loss = F.cross_entropy(
+        flat_logits,
+        flat_labels,
+        ignore_index=-100,
+        reduction='none'  # Don't reduce - keep per-token losses
+    )
+
+    # Reshape back to (batch_size, seq_len)
+    token_loss = flat_loss.view(batch_size, seq_len)
+
+    return token_loss
+```
+
+**Use case:** Find which response tokens have highest loss:
+
+```python
+token_losses = compute_token_level_loss(logits, labels)
+
+# Get non-masked positions
+mask = (labels[:, 1:] != -100)
+masked_losses = token_losses * mask
+
+# Find hardest tokens to predict
+hardest_positions = masked_losses.argmax(dim=1)
+
+# Decode to see which words are hard
+for i, pos in enumerate(hardest_positions):
+    token_id = input_ids[i, pos+1]  # +1 due to shifting
+    token = tokenizer.decode([token_id])
+    loss_val = masked_losses[i, pos].item()
+    print(f"Hardest token: '{token}' (loss: {loss_val:.3f})")
+```
+
+This helps identify:
+- Rare words the model struggles with
+- Concepts that need more training data
+- Potential label errors
+
+## Loss Masking in Multi-Turn Conversations
+
+For chat format with multiple turns, we typically mask everything except the final assistant response:
+
+From `/home/user/autotune/src/auto_bot_tuner/sft/dataset.py:146-164`:
+
+```python
+for msg in messages:
+    role = msg["role"]
+    content = msg["content"]
+
+    if role == "user":
+        prompt_parts.append(f"User: {content}")
+    elif role == "assistant":
+        if msg == messages[-1]:
+            # This is the target response - DON'T mask
+            response = content
+        else:
+            # Previous assistant messages are part of context - MASK THESE
+            prompt_parts.append(f"Assistant: {content}")
+```
+
+**Example:**
+
+```
+User: Hi!
+Assistant: Hello! How can I help?       ← Masked (context)
+User: What's 2+2?
+Assistant: It's 4.                      ← NOT masked (target)
+```
+
+<Aside type="tip">
+If you want the model to learn from all assistant turns, tokenize each turn separately and create multiple training examples.
+</Aside>
+
+## Validation and Debugging
+
+Always validate your masking:
+
+```python
+from src.auto_bot_tuner.sft.dataset import preview_formatted_sample
+
+# Preview to check masking
+preview = preview_formatted_sample(dataset, idx=0, decode=True)
+
+print("Full sequence:")
+print(preview["full_text"])
+print(f"\nTokens trained on ({preview['num_response_tokens']}):")
+print(preview["response_only"])
+print(f"\nTokens masked ({preview['num_prompt_tokens']}): [hidden]")
+
+# Check ratio
+total = preview['num_response_tokens'] + preview['num_prompt_tokens']
+ratio = preview['num_response_tokens'] / total
+print(f"\nTraining on {ratio*100:.1f}% of tokens")
+```
+
+**Healthy ratios:**
+- 20-40%: Good - most tokens are context, some are training targets
+- 40-60%: OK - balanced between context and training
+- 60%+: Warning - responses may be too long, prone to verbosity
+- &lt;10%: Problem - prompts are too long, not enough training signal
+
+## Summary
+
+Loss masking is fundamental to instruction tuning:
+
+1. **Set prompt labels to -100** to exclude them from loss computation
+2. **Include response labels as actual token IDs** to train on them
+3. **Remember to shift** for next-token prediction
+4. **Mask padding tokens** to avoid training on pad tokens
+5. **Include the EOS token** in the response to teach the model when to stop
+
+**Mathematical foundation:**
+
+$$
+\mathcal{L}_{\text{masked}} = -\frac{1}{|R|} \sum_{i \in R} \log P(y_i | x_{1:i-1})
+$$
+
+Where $R$ = non-masked positions (response tokens only).
+
+**Implementation pattern:**
+
+```python
+# 1. Tokenize separately
+prompt_ids = tokenizer.encode(prompt, add_special_tokens=True)
+response_ids = tokenizer.encode(response, add_special_tokens=False)
+
+# 2. Create masked labels
+labels = [-100] * len(prompt_ids) + response_ids + [eos_token_id]
+
+# 3. Pad with -100
+labels = labels + [-100] * (max_length - len(labels))
+
+# 4. Compute loss with ignore_index=-100
+loss = F.cross_entropy(logits, labels, ignore_index=-100)
+```
+
+**Next:** Explore the full [Training Loop](./training) to see how loss masking integrates with optimization, checkpointing, and evaluation.

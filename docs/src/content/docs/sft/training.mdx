@@ -1,0 +1,999 @@
+---
+title: Training Loop
+description: Understanding the complete SFT training process from optimization to checkpointing
+---
+
+import { Aside, Card, Tabs, TabItem } from '@astrojs/starlight/components';
+
+## Overview
+
+The SFT training loop orchestrates several components:
+
+1. **Data loading** - Batching and shuffling training examples
+2. **Forward pass** - Computing model predictions
+3. **Loss computation** - Measuring prediction quality
+4. **Backward pass** - Computing gradients
+5. **Optimization** - Updating model weights
+6. **Learning rate scheduling** - Adjusting learning rate over time
+7. **Gradient accumulation** - Simulating larger batch sizes
+8. **Checkpointing** - Saving model states
+9. **Evaluation** - Measuring validation performance
+10. **Logging** - Tracking training progress
+
+Let's explore each component in depth.
+
+## The SFTTrainer Class
+
+The main training logic lives in `/home/user/autotune/src/auto_bot_tuner/sft/trainer.py`.
+
+### Configuration
+
+From `/home/user/autotune/src/auto_bot_tuner/sft/trainer.py:30-66`:
+
+```python
+@dataclass
+class SFTConfig:
+    """Configuration for SFT training."""
+
+    # Training hyperparameters
+    learning_rate: float = 2e-5
+    batch_size: int = 4
+    gradient_accumulation_steps: int = 4  # Effective batch size = batch_size * grad_accum
+    num_epochs: int = 3
+    max_steps: Optional[int] = None  # If set, overrides num_epochs
+    warmup_steps: int = 100
+    max_grad_norm: float = 1.0  # Gradient clipping
+
+    # Optimization
+    weight_decay: float = 0.01
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.999
+    adam_epsilon: float = 1e-8
+
+    # Logging and checkpointing
+    logging_steps: int = 10
+    eval_steps: Optional[int] = 500
+    save_steps: int = 1000
+    save_total_limit: int = 3  # Keep only N most recent checkpoints
+
+    # Paths
+    output_dir: str = "checkpoints/sft"
+    resume_from_checkpoint: Optional[str] = None
+
+    # Mixed precision
+    fp16: bool = False  # Use FP16 training
+    bf16: bool = False  # Use BF16 training (better for modern GPUs)
+
+    # Misc
+    seed: int = 42
+    dataloader_num_workers: int = 0
+```
+
+<Aside type="tip">
+**Quick tuning guide:**
+- Start with defaults
+- Increase `gradient_accumulation_steps` if you get OOM errors
+- Increase `learning_rate` if training is too slow, decrease if loss diverges
+- Adjust `num_epochs` based on dataset size (more data = fewer epochs needed)
+</Aside>
+
+## Data Loading
+
+### Creating the DataLoader
+
+From `/home/user/autotune/src/auto_bot_tuner/sft/trainer.py:356-363`:
+
+```python
+# Create dataloader
+train_loader = DataLoader(
+    self.train_dataset,
+    batch_size=self.config.batch_size,
+    shuffle=True,  # Randomize order each epoch
+    num_workers=self.config.dataloader_num_workers,
+    pin_memory=True if self.device.type == "cuda" else False
+)
+```
+
+**Key parameters:**
+- `batch_size=4`: Process 4 examples at once
+- `shuffle=True`: Randomize order to prevent overfitting to sequence
+- `pin_memory=True`: Speed up CPU→GPU transfer (CUDA only)
+- `num_workers=0`: Use main process for loading (simple, reliable)
+
+### Why Batching Matters
+
+**Without batching:**
+```python
+for example in dataset:
+    loss = compute_loss(model(example))
+    loss.backward()
+    optimizer.step()  # Update after EVERY example
+```
+- 10,000 examples = 10,000 optimizer steps
+- High variance in gradients
+- Inefficient GPU utilization
+
+**With batching:**
+```python
+for batch in dataloader:
+    loss = compute_loss(model(batch))  # Process 4 examples at once
+    loss.backward()
+    optimizer.step()  # Update after 4 examples
+```
+- 10,000 examples = 2,500 optimizer steps
+- Smoother gradients
+- Better GPU utilization
+
+<Aside type="note">
+Larger batches = more stable gradients but slower convergence per example. Batch size 4-32 is typical for LLM fine-tuning.
+</Aside>
+
+## The Training Loop
+
+From `/home/user/autotune/src/auto_bot_tuner/sft/trainer.py:380-473`:
+
+```python
+for epoch in range(self.config.num_epochs):
+    self.epoch = epoch
+
+    for batch_idx, batch in enumerate(train_loader):
+        # Move batch to device
+        batch = {k: v.to(self.device) for k, v in batch.items()}
+
+        # Forward pass
+        outputs = self.model(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"]
+        )
+
+        # Compute loss
+        metrics = compute_sft_loss_with_metrics(outputs.logits, batch["labels"])
+        loss = metrics["loss"]
+
+        # Scale loss for gradient accumulation
+        loss = loss / self.config.gradient_accumulation_steps
+
+        # Backward pass
+        loss.backward()
+
+        # Accumulate metrics
+        total_loss += loss.item() * self.config.gradient_accumulation_steps
+        total_tokens += metrics["num_tokens"].item()
+
+        # Update weights every gradient_accumulation_steps
+        if (batch_idx + 1) % self.config.gradient_accumulation_steps == 0:
+            # Clip gradients
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(),
+                self.config.max_grad_norm
+            )
+
+            # Update weights
+            self.optimizer.step()
+            self.scheduler.step()
+            self.optimizer.zero_grad()
+
+            self.global_step += 1
+            progress_bar.update(1)
+```
+
+Let's break down each part.
+
+### Forward Pass
+
+```python
+outputs = self.model(
+    input_ids=batch["input_ids"],
+    attention_mask=batch["attention_mask"]
+)
+```
+
+This runs the model forward to get predictions:
+
+**Input:**
+- `input_ids`: Token IDs, shape `(batch_size, seq_len)`
+- `attention_mask`: Which tokens to attend to, shape `(batch_size, seq_len)`
+
+**Output:**
+- `outputs.logits`: Raw predictions, shape `(batch_size, seq_len, vocab_size)`
+
+Each position gets a score for every token in the vocabulary.
+
+### Loss Computation
+
+```python
+metrics = compute_sft_loss_with_metrics(outputs.logits, batch["labels"])
+loss = metrics["loss"]
+```
+
+Computes cross-entropy loss with masking (see [Loss Masking](./loss-masking)):
+
+$$
+\mathcal{L} = -\frac{1}{|R|} \sum_{i \in R} \log P(y_i | x_{1:i-1})
+$$
+
+Returns:
+- `loss`: Scalar tensor for backpropagation
+- `perplexity`: $\exp(\text{loss})$
+- `accuracy`: Token-level accuracy
+- `num_tokens`: Number of non-masked tokens
+
+### Backward Pass
+
+```python
+loss.backward()
+```
+
+This single line does a lot:
+
+1. **Computes gradients** for all parameters:
+   $$\frac{\partial \mathcal{L}}{\partial \theta}$$
+
+2. **Stores gradients** in `parameter.grad` for each parameter
+
+3. **Uses chain rule** to backpropagate through all layers
+
+<Aside type="note">
+Gradients accumulate! If you don't call `optimizer.zero_grad()`, gradients from multiple batches sum up.
+</Aside>
+
+## Gradient Accumulation
+
+### The Problem: Memory Constraints
+
+Large batch sizes improve training but require more memory:
+
+```
+Batch size 32 with seq_len 512:
+- Activations: ~4 GB
+- Gradients: ~4 GB
+- Model: ~2 GB
+Total: ~10 GB
+```
+
+Your GPU might only have 8 GB!
+
+### The Solution: Accumulate Gradients
+
+Process small batches, accumulate gradients, then update:
+
+```python
+# Scale loss for gradient accumulation
+loss = loss / self.config.gradient_accumulation_steps
+
+# Backward pass (gradients accumulate)
+loss.backward()
+
+# Update weights every N batches
+if (batch_idx + 1) % self.config.gradient_accumulation_steps == 0:
+    optimizer.step()
+    optimizer.zero_grad()
+```
+
+**Example with `gradient_accumulation_steps=4`:**
+
+```
+Batch 1: loss.backward()  → gradients added to .grad
+Batch 2: loss.backward()  → gradients added to .grad
+Batch 3: loss.backward()  → gradients added to .grad
+Batch 4: loss.backward()  → gradients added to .grad
+         optimizer.step() → update weights using accumulated gradients
+         zero_grad()      → reset gradients to zero
+```
+
+**Effect:** Simulates batch size of `4 × 4 = 16` while only using memory for batch size 4!
+
+### Why Scale the Loss?
+
+```python
+loss = loss / self.config.gradient_accumulation_steps
+```
+
+Without scaling:
+
+```
+Step 1: gradients from batch 1  (magnitude ~1.0)
+Step 2: + gradients from batch 2 (total ~2.0)
+Step 3: + gradients from batch 3 (total ~3.0)
+Step 4: + gradients from batch 4 (total ~4.0)  # 4x too large!
+```
+
+With scaling:
+
+```
+Step 1: gradients / 4 (magnitude ~0.25)
+Step 2: + gradients / 4 (total ~0.5)
+Step 3: + gradients / 4 (total ~0.75)
+Step 4: + gradients / 4 (total ~1.0)  # Correct magnitude!
+```
+
+<Aside type="caution">
+Don't forget to scale the loss! Without it, your effective learning rate is multiplied by `gradient_accumulation_steps`.
+</Aside>
+
+## Gradient Clipping
+
+From `/home/user/autotune/src/auto_bot_tuner/sft/trainer.py:409-413`:
+
+```python
+# Clip gradients
+torch.nn.utils.clip_grad_norm_(
+    self.model.parameters(),
+    self.config.max_grad_norm
+)
+```
+
+### Why Clip Gradients?
+
+Neural networks can have **exploding gradients** - sudden spikes in gradient magnitude:
+
+```
+Step 1: gradient norm = 0.5  ✓
+Step 2: gradient norm = 0.8  ✓
+Step 3: gradient norm = 15.0 ✗  Explosion!
+Step 4: gradient norm = NaN  ✗  Training collapsed
+```
+
+### How Clipping Works
+
+If gradient norm exceeds threshold, scale it down:
+
+$$
+\text{if } \|\nabla \mathcal{L}\| > \text{max\_norm}: \quad \nabla \mathcal{L} \leftarrow \frac{\text{max\_norm}}{\|\nabla \mathcal{L}\|} \cdot \nabla \mathcal{L}
+$$
+
+**Example with `max_grad_norm=1.0`:**
+
+```python
+# Before clipping
+gradient = [2.0, 1.5, -3.0]  # norm = 3.9
+
+# After clipping
+gradient = [0.51, 0.38, -0.77]  # norm = 1.0 (scaled down)
+```
+
+**Benefits:**
+- Prevents training instability
+- Allows higher learning rates
+- Essential for transformer models
+
+<Aside type="tip">
+Default `max_grad_norm=1.0` works well. Increase to 5.0 if training is too conservative, decrease to 0.5 if training is unstable.
+</Aside>
+
+## Optimization with AdamW
+
+From `/home/user/autotune/src/auto_bot_tuner/sft/trainer.py:142-180`:
+
+```python
+def _create_optimizer(self) -> torch.optim.Optimizer:
+    """
+    Create AdamW optimizer with weight decay.
+
+    Educational note:
+    AdamW is a variant of Adam that properly implements weight decay
+    (L2 regularization). It prevents overfitting by penalizing large weights.
+    """
+    # Separate parameters that should and shouldn't have weight decay
+    decay_params = []
+    no_decay_params = []
+
+    for name, param in self.model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        # Don't apply weight decay to biases and layer norms
+        if "bias" in name or "layer_norm" in name or "layernorm" in name:
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
+
+    optimizer_grouped_parameters = [
+        {
+            "params": decay_params,
+            "weight_decay": self.config.weight_decay,
+        },
+        {
+            "params": no_decay_params,
+            "weight_decay": 0.0,
+        },
+    ]
+
+    return AdamW(
+        optimizer_grouped_parameters,
+        lr=self.config.learning_rate,
+        betas=(self.config.adam_beta1, self.config.adam_beta2),
+        eps=self.config.adam_epsilon,
+    )
+```
+
+### Why AdamW?
+
+AdamW combines three ideas:
+
+1. **Momentum** (first moment): Smooth out gradient noise
+   $$m_t = \beta_1 m_{t-1} + (1 - \beta_1) \nabla \mathcal{L}_t$$
+
+2. **Adaptive learning rates** (second moment): Different learning rate per parameter
+   $$v_t = \beta_2 v_{t-1} + (1 - \beta_2) (\nabla \mathcal{L}_t)^2$$
+
+3. **Weight decay**: Regularization to prevent overfitting
+   $$\theta_t = \theta_{t-1} - \eta \cdot (\text{adam\_update} + \lambda \theta_{t-1})$$
+
+**Why not SGD?** Adam adapts to each parameter's gradient history, crucial for transformers where different layers need different learning rates.
+
+### Weight Decay Groups
+
+Notice we exclude biases and layer norms from weight decay:
+
+```python
+# Don't apply weight decay to biases and layer norms
+if "bias" in name or "layer_norm" in name or "layernorm" in name:
+    no_decay_params.append(param)
+```
+
+**Why?**
+- Biases are scalar offsets, not weights - penalizing them doesn't help
+- Layer norm parameters are normalization factors - L2 regularization interferes with normalization
+
+<Aside type="note">
+This is a best practice from "Decoupled Weight Decay Regularization" (Loshchilov & Hutter, 2019).
+</Aside>
+
+## Learning Rate Scheduling
+
+From `/home/user/autotune/src/auto_bot_tuner/sft/trainer.py:182-206`:
+
+```python
+def _create_scheduler(self) -> LambdaLR:
+    """
+    Create learning rate scheduler with linear warmup and decay.
+
+    Educational note:
+    Learning rate warmup gradually increases LR from 0 to target LR
+    over the first N steps. This helps stabilize training in early stages.
+    After warmup, we linearly decay back to 0 by the end of training.
+    """
+    def lr_lambda(current_step: int) -> float:
+        if current_step < self.config.warmup_steps:
+            # Linear warmup
+            return float(current_step) / float(max(1, self.config.warmup_steps))
+        else:
+            # Linear decay
+            total_steps = self.config.max_steps or (
+                len(self.train_dataset) // (self.config.batch_size * self.config.gradient_accumulation_steps)
+                * self.config.num_epochs
+            )
+            progress = float(current_step - self.config.warmup_steps) / float(
+                max(1, total_steps - self.config.warmup_steps)
+            )
+            return max(0.0, 1.0 - progress)
+
+    return LambdaLR(self.optimizer, lr_lambda)
+```
+
+### Learning Rate Schedule Visualization
+
+```
+LR
+│
+│ 2e-5 ────────┐
+│              │╲
+│              │ ╲
+│              │  ╲
+│             ╱│   ╲___
+│           ╱  │       ╲___
+│         ╱    │           ╲___
+│       ╱      │               ╲___
+│     ╱        │                   ╲___
+│   ╱          │                       ╲
+│ ╱            │                         ╲
+└──────────────┼──────────────────────────┼─→ Steps
+           Warmup                      Total
+           (100)                      (10000)
+```
+
+### Why Warmup?
+
+Starting with full learning rate can be unstable:
+
+**Without warmup:**
+```
+Step 1: LR = 2e-5, loss = 5.2
+Step 2: LR = 2e-5, loss = 15.8  ← Jumped too far!
+Step 3: LR = 2e-5, loss = NaN   ← Exploded!
+```
+
+**With warmup:**
+```
+Step 1: LR = 2e-7, loss = 5.2
+Step 2: LR = 4e-7, loss = 5.1  ← Gentle start
+Step 100: LR = 2e-5, loss = 3.8 ← Now stable
+```
+
+### Why Decay?
+
+As training progresses, smaller steps help convergence:
+
+**Mathematical intuition:** Near a minimum, the loss surface looks like a valley. Large steps bounce between walls, small steps settle at the bottom.
+
+$$
+\text{Early:} \quad \eta = 2 \times 10^{-5} \quad \text{(explore)}
+$$
+$$
+\text{Late:} \quad \eta = 1 \times 10^{-6} \quad \text{(fine-tune)}
+$$
+
+<Aside type="tip">
+Standard warmup is 100-500 steps. More warmup for larger models or higher learning rates.
+</Aside>
+
+## Checkpointing
+
+From `/home/user/autotune/src/auto_bot_tuner/sft/trainer.py:551-584`:
+
+```python
+def save_checkpoint(self, is_best: bool = False, is_final: bool = False) -> None:
+    """
+    Save model checkpoint.
+
+    Args:
+        is_best: Whether this is the best model so far
+        is_final: Whether this is the final checkpoint
+    """
+    if is_final:
+        checkpoint_dir = Path(self.config.output_dir) / "final"
+    elif is_best:
+        checkpoint_dir = Path(self.config.output_dir) / "best"
+    else:
+        checkpoint_dir = Path(self.config.output_dir) / f"checkpoint-{self.global_step}"
+
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save model and tokenizer
+    self.model.save_pretrained(checkpoint_dir)
+    self.tokenizer.save_pretrained(checkpoint_dir)
+
+    # Save training state
+    state = {
+        "global_step": self.global_step,
+        "epoch": self.epoch,
+        "best_eval_loss": self.best_eval_loss,
+        "optimizer_state": self.optimizer.state_dict(),
+        "scheduler_state": self.scheduler.state_dict(),
+    }
+
+    torch.save(state, checkpoint_dir / "training_state.pt")
+
+    print(f"\nCheckpoint saved to {checkpoint_dir}")
+```
+
+### What Gets Saved?
+
+1. **Model weights** (`model.save_pretrained()`)
+   - All parameter tensors
+   - Model configuration
+   - Can be loaded for inference or continued training
+
+2. **Tokenizer** (`tokenizer.save_pretrained()`)
+   - Vocabulary
+   - Special tokens
+   - Tokenization config
+
+3. **Training state** (`torch.save(state, ...)`)
+   - Current step and epoch
+   - Optimizer state (momentum, variance estimates)
+   - Scheduler state (current learning rate)
+   - Best validation loss
+
+### Why Save Training State?
+
+Resuming training without state:
+
+```
+Training interrupted at step 5000
+Resume from checkpoint...
+Optimizer state lost → momentum reset to 0
+Scheduler state lost → LR reset to initial value
+→ Training is unstable, loss spikes!
+```
+
+Resuming with state:
+
+```
+Training interrupted at step 5000
+Resume from checkpoint...
+Optimizer state restored → momentum continues smoothly
+Scheduler state restored → LR continues decay
+→ Training continues seamlessly!
+```
+
+### Checkpoint Types
+
+**Regular checkpoints** (`checkpoint-{step}`):
+- Saved every `save_steps` (e.g., 1000)
+- Useful for resuming training
+- Can be large (multiple GB)
+
+**Best checkpoint** (`best/`):
+- Saved when validation loss improves
+- Your best model for deployment
+- Only one kept (overwrites previous)
+
+**Final checkpoint** (`final/`):
+- Saved at end of training
+- May not be the best (could overfit)
+- Useful for continuing to more epochs
+
+<Aside type="tip">
+Set `save_total_limit=3` to keep only the 3 most recent regular checkpoints, saving disk space.
+</Aside>
+
+## Evaluation
+
+From `/home/user/autotune/src/auto_bot_tuner/sft/trainer.py:496-549`:
+
+```python
+def evaluate(self) -> dict:
+    """
+    Evaluate the model on the eval dataset.
+
+    Returns:
+        Dictionary with evaluation metrics
+    """
+    if self.eval_dataset is None:
+        return {}
+
+    self.model.eval()  # Switch to evaluation mode
+
+    eval_loader = DataLoader(
+        self.eval_dataset,
+        batch_size=self.config.batch_size,
+        shuffle=False,  # Don't shuffle eval data
+        num_workers=self.config.dataloader_num_workers
+    )
+
+    total_loss = 0.0
+    total_accuracy = 0.0
+    total_tokens = 0
+    num_batches = 0
+
+    with torch.no_grad():  # Don't compute gradients during eval
+        for batch in tqdm(eval_loader, desc="Evaluating"):
+            batch = {k: v.to(self.device) for k, v in batch.items()}
+
+            outputs = self.model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"]
+            )
+
+            metrics = compute_sft_loss_with_metrics(outputs.logits, batch["labels"])
+
+            total_loss += metrics["loss"].item()
+            total_accuracy += metrics["accuracy"].item()
+            total_tokens += metrics["num_tokens"].item()
+            num_batches += 1
+
+    avg_loss = total_loss / num_batches
+    avg_accuracy = total_accuracy / num_batches
+    perplexity = torch.exp(torch.tensor(avg_loss)).item()
+
+    eval_metrics = {
+        "loss": avg_loss,
+        "perplexity": perplexity,
+        "accuracy": avg_accuracy,
+        "num_tokens": total_tokens
+    }
+
+    print(f"\nEvaluation - Loss: {avg_loss:.4f}, Perplexity: {perplexity:.2f}, Accuracy: {avg_accuracy:.4f}")
+
+    return eval_metrics
+```
+
+### Key Differences from Training
+
+**Training mode:**
+```python
+self.model.train()
+loss.backward()
+optimizer.step()
+```
+- Dropout enabled (randomness)
+- Batch norm updates statistics
+- Gradients computed
+
+**Evaluation mode:**
+```python
+self.model.eval()
+with torch.no_grad():
+    outputs = model(...)
+```
+- Dropout disabled (deterministic)
+- Batch norm uses running statistics
+- No gradients (faster, less memory)
+
+### Evaluation Metrics
+
+**Loss:** How well the model predicts tokens
+- Lower is better
+- Directly optimized during training
+
+**Perplexity:** $\exp(\text{loss})$
+- Interpretable as "how many choices the model is confused between"
+- Perplexity 10 = model is ~10-ways confused
+- Perplexity 1 = model is certain (perfect)
+
+**Accuracy:** Percentage of tokens predicted correctly
+- Easy to understand
+- Can be misleading (high accuracy doesn't mean good generation)
+
+<Aside type="note">
+For generation quality, consider human evaluation or metrics like ROUGE/BLEU in addition to perplexity.
+</Aside>
+
+### When to Evaluate?
+
+From the training loop:
+
+```python
+# Evaluation
+if self.config.eval_steps and self.global_step % self.config.eval_steps == 0:
+    if self.eval_dataset is not None:
+        eval_metrics = self.evaluate()
+        self.model.train()  # Back to training mode
+
+        if eval_metrics["loss"] < self.best_eval_loss:
+            self.best_eval_loss = eval_metrics["loss"]
+            self.save_checkpoint(is_best=True)
+```
+
+Typical: Evaluate every 500-1000 steps
+
+**Too frequent:** Slows down training
+**Too rare:** Might miss the best checkpoint
+
+## Monitoring Training Progress
+
+### Progress Bar
+
+```python
+progress_bar = tqdm(total=total_steps, desc="Training")
+
+# Inside training loop
+progress_bar.update(1)
+progress_bar.set_postfix({
+    "loss": f"{avg_loss:.4f}",
+    "lr": f"{lr:.2e}",
+    "tokens": total_tokens
+})
+```
+
+**Output:**
+```
+Training: 45%|████████▌         | 4500/10000 [1:23:45<1:31:22, loss=2.1234, lr=1.5e-05, tokens=1.2M]
+```
+
+### Logging
+
+From `/home/user/autotune/src/auto_bot_tuner/sft/trainer.py:424-440`:
+
+```python
+# Logging
+if self.global_step % self.config.logging_steps == 0:
+    avg_loss = total_loss / self.config.logging_steps
+    lr = self.scheduler.get_last_lr()[0]
+
+    progress_bar.set_postfix({
+        "loss": f"{avg_loss:.4f}",
+        "lr": f"{lr:.2e}",
+        "tokens": total_tokens
+    })
+
+    # Update progress tracking
+    self._update_progress_tracking(
+        current_step=self.global_step,
+        metrics={"loss": avg_loss, "learning_rate": lr}
+    )
+
+    total_loss = 0.0
+```
+
+**What to watch:**
+- **Loss decreasing:** Training is working ✓
+- **Loss increasing:** Learning rate too high or data issue ✗
+- **Loss plateauing:** May need more epochs or higher LR ⚠
+- **LR decreasing:** Scheduler is working ✓
+
+## Complete Training Example
+
+Let's put it all together:
+
+```python
+from src.auto_bot_tuner.sft import SFTTrainer, SFTConfig, InstructionDataset
+from src.auto_bot_tuner.utils.model_loading import load_model_and_tokenizer
+from datasets import load_dataset
+
+# 1. Load model and tokenizer
+model, tokenizer, device = load_model_and_tokenizer("gpt2", use_lora=True)
+
+# 2. Prepare dataset
+raw_data = load_dataset("yahma/alpaca-cleaned", split="train[:1000]")
+train_dataset = InstructionDataset(raw_data, tokenizer, max_length=512)
+
+# 3. Configure training
+config = SFTConfig(
+    learning_rate=2e-5,
+    batch_size=4,
+    gradient_accumulation_steps=4,  # Effective batch size: 16
+    num_epochs=3,
+    warmup_steps=100,
+    max_grad_norm=1.0,
+    logging_steps=10,
+    eval_steps=500,
+    save_steps=1000,
+    output_dir="checkpoints/gpt2-alpaca-sft"
+)
+
+# 4. Create trainer
+trainer = SFTTrainer(
+    model=model,
+    tokenizer=tokenizer,
+    train_dataset=train_dataset,
+    config=config
+)
+
+# 5. Train!
+summary = trainer.train()
+
+print(f"Training complete!")
+print(f"Total steps: {summary['total_steps']}")
+print(f"Epochs completed: {summary['epochs_completed']}")
+print(f"Best eval loss: {summary['best_eval_loss']}")
+```
+
+**Expected output:**
+```
+Training: 100%|██████████| 187/187 [12:34<00:00, loss=1.8234, lr=1.2e-06, tokens=89.2K]
+
+Checkpoint saved to checkpoints/gpt2-alpaca-sft/final
+
+Training complete!
+Total steps: 187
+Epochs completed: 3
+Best eval loss: 1.7523
+```
+
+## Advanced Topics
+
+### Mixed Precision Training
+
+For faster training on modern GPUs:
+
+```python
+config = SFTConfig(
+    bf16=True,  # Use bfloat16 (recommended for Ampere+ GPUs)
+    # OR
+    fp16=True,  # Use float16 (older GPUs)
+)
+```
+
+**Benefits:**
+- 2x faster training
+- 50% less memory
+- Minimal accuracy impact
+
+**bfloat16 vs float16:**
+- **bfloat16**: Same range as float32, less overflow risk
+- **float16**: Smaller range, may need loss scaling
+
+<Aside type="tip">
+Use `bf16=True` on NVIDIA A100/A6000 or newer. Use `fp16=True` on V100 or older.
+</Aside>
+
+### Resuming from Checkpoint
+
+```python
+config = SFTConfig(
+    resume_from_checkpoint="checkpoints/gpt2-alpaca-sft/checkpoint-5000",
+    # ... other config
+)
+```
+
+Training will resume from step 5000 with optimizer and scheduler state restored.
+
+### Custom Callbacks
+
+```python
+def log_to_wandb(trainer, metrics):
+    """Custom callback to log to Weights & Biases"""
+    wandb.log({
+        "train/loss": metrics["loss"],
+        "train/perplexity": metrics["perplexity"],
+        "train/accuracy": metrics["accuracy"],
+        "global_step": trainer.global_step
+    })
+
+trainer = SFTTrainer(
+    # ... other args
+    callbacks=[log_to_wandb]
+)
+```
+
+Callbacks are called after each optimization step.
+
+## Troubleshooting
+
+### Loss is NaN
+
+**Causes:**
+- Learning rate too high → Reduce to 1e-5
+- Gradient explosion → Check `max_grad_norm=1.0` is enabled
+- Numerical instability → Enable mixed precision (`bf16=True`)
+
+### Out of Memory (OOM)
+
+**Solutions:**
+1. Decrease `batch_size` (e.g., 4 → 2)
+2. Increase `gradient_accumulation_steps` (e.g., 4 → 8)
+3. Decrease `max_length` (e.g., 512 → 256)
+4. Use LoRA instead of full fine-tuning
+5. Enable gradient checkpointing (not shown, advanced)
+
+### Training Too Slow
+
+**Solutions:**
+1. Increase `batch_size` (if memory allows)
+2. Use mixed precision (`bf16=True`)
+3. Decrease `eval_steps` (evaluate less often)
+4. Use `num_workers=4` in DataLoader (may help on CPU bottlenecks)
+
+### Validation Loss Increasing
+
+**Cause:** Overfitting
+
+**Solutions:**
+1. Use more training data
+2. Increase weight decay (0.01 → 0.1)
+3. Reduce epochs (3 → 1)
+4. Add dropout (requires model modification)
+
+### Learning Not Happening
+
+**Causes:**
+- Learning rate too low → Increase to 5e-5
+- Warmup too long → Decrease `warmup_steps`
+- Prompts aren't masked → Check [Loss Masking](./loss-masking)
+
+## Summary
+
+The SFT training loop orchestrates:
+
+1. **Data loading**: Batching examples for efficient processing
+2. **Forward pass**: Model predictions for each batch
+3. **Loss computation**: Measuring prediction quality with masking
+4. **Backward pass**: Computing gradients via backpropagation
+5. **Gradient accumulation**: Simulating larger batches
+6. **Gradient clipping**: Preventing training instability
+7. **Optimization**: Updating weights with AdamW
+8. **Learning rate scheduling**: Warmup and decay for stability
+9. **Checkpointing**: Saving model states for recovery
+10. **Evaluation**: Measuring validation performance
+11. **Logging**: Tracking training progress
+
+**Key hyperparameters:**
+- `learning_rate`: 2e-5 (typical for LLMs)
+- `batch_size`: 4-8 (memory-dependent)
+- `gradient_accumulation_steps`: 4-8 (effective batch size)
+- `num_epochs`: 1-3 (more data = fewer epochs)
+- `warmup_steps`: 100-500
+- `max_grad_norm`: 1.0
+
+**Best practices:**
+- Start with defaults, tune if needed
+- Monitor loss, perplexity, and learning rate
+- Save checkpoints frequently
+- Evaluate regularly to catch overfitting
+- Use mixed precision for speed
+- Use LoRA for memory efficiency
+
+**Next:** Learn about [LoRA](./lora) to understand how to train large models efficiently with parameter-efficient fine-tuning.

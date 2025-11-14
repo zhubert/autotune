@@ -1,0 +1,514 @@
+---
+title: Introduction to Reward Modeling
+description: Understanding reward models, the Bradley-Terry model, and why reward models are essential for RLHF
+---
+
+import { Card, CardGrid, Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+## What is a Reward Model?
+
+A **reward model** is a neural network that predicts how good, helpful, or aligned a response is. Unlike language models that generate text, reward models output a single scalar score indicating response quality.
+
+<Aside type="note">
+  **Key insight:** Reward models learn to predict **human preferences** from comparison data. They don't generate text—they evaluate it.
+</Aside>
+
+### The Core Problem
+
+After Supervised Fine-Tuning (SFT), models can follow instructions, but they don't understand:
+- Which of multiple correct answers is **better**
+- What makes a response more **helpful** or **harmless**
+- How to optimize for human values beyond demonstration
+
+Consider this example:
+
+```
+Prompt: "Explain quantum computing to a 10-year-old."
+
+Response A: "Quantum computers use qubits and superposition
+to leverage quantum-mechanical phenomena for computation
+according to the Schrödinger equation."
+
+Response B: "Imagine a coin spinning in the air—it's both
+heads and tails at the same time until it lands. Quantum
+computers work like thousands of these spinning coins,
+trying all possibilities at once to find the answer faster!"
+```
+
+Both responses are factually correct, but **B is clearly better** for a 10-year-old. How do we teach models this preference?
+
+**Answer:** Train a reward model to assign higher scores to preferred responses, then use it to guide reinforcement learning!
+
+## Why Reward Models for RLHF?
+
+RLHF (Reinforcement Learning from Human Feedback) uses reward models as the "judge" that guides policy optimization.
+
+<CardGrid>
+  <Card title="Scalability" icon="rocket">
+    Collecting preference data is easier than writing demonstrations. Humans just pick the better response—no need to write perfect answers!
+  </Card>
+
+  <Card title="Subtle Preferences" icon="approve-check">
+    Reward models learn nuanced preferences that are hard to demonstrate: tone, helpfulness, safety, conciseness.
+  </Card>
+
+  <Card title="Optimization Target" icon="star">
+    Provides a differentiable objective for RL. The policy can optimize for higher rewards through gradient descent.
+  </Card>
+
+  <Card title="Transfer Learning" icon="puzzle">
+    One reward model can guide training of multiple policy models, amortizing the cost of human feedback collection.
+  </Card>
+</CardGrid>
+
+## The RLHF Pipeline with Reward Models
+
+```
+┌──────────────────────────┐
+│  1. Supervised Fine-Tune │
+│                          │
+│  Base Model → SFT Model  │
+└────────────┬─────────────┘
+             │
+             ▼
+┌──────────────────────────┐
+│  2. Train Reward Model   │
+│                          │
+│  Collect preferences     │
+│  Train RM on comparisons │
+└────────────┬─────────────┘
+             │
+             ▼
+┌──────────────────────────┐
+│  3. RL Optimization      │
+│                          │
+│  Use RM to guide PPO     │
+│  Optimize policy for     │
+│  high reward scores      │
+└──────────────────────────┘
+```
+
+The reward model acts as a **proxy for human judgment** during RL training.
+
+## The Bradley-Terry Model
+
+Reward model training is based on the **Bradley-Terry model**, a classic statistical model for pairwise comparisons.
+
+### The Mathematical Foundation
+
+Given two responses $y_w$ (chosen/winner) and $y_l$ (rejected/loser) to the same prompt $x$, the Bradley-Terry model says:
+
+$$
+P(y_w \succ y_l | x) = \frac{\exp(r_\theta(x, y_w))}{\exp(r_\theta(x, y_w)) + \exp(r_\theta(x, y_l))}
+$$
+
+This simplifies to:
+
+$$
+P(y_w \succ y_l | x) = \sigma(r_\theta(x, y_w) - r_\theta(x, y_l))
+$$
+
+where:
+- $r_\theta(x, y)$ is the reward model's scalar score for response $y$ to prompt $x$
+- $\sigma$ is the sigmoid function: $\sigma(z) = \frac{1}{1 + e^{-z}}$
+- $\succ$ means "is preferred to"
+
+**Interpretation:** The probability that humans prefer $y_w$ over $y_l$ is determined by the **difference** in their reward scores, passed through a sigmoid.
+
+### The Ranking Loss
+
+We train the reward model to maximize the probability of observed preferences:
+
+$$
+\mathcal{L}_{\text{RM}} = -\mathbb{E}_{(x, y_w, y_l) \sim D} \left[ \log \sigma(r_\theta(x, y_w) - r_\theta(x, y_l)) \right]
+$$
+
+This is equivalent to:
+
+$$
+\mathcal{L}_{\text{RM}} = \mathbb{E}_{(x, y_w, y_l) \sim D} \left[ \log(1 + \exp(r_\theta(x, y_l) - r_\theta(x, y_w))) \right]
+$$
+
+**Goal:** Make $r_\theta(x, y_w) - r_\theta(x, y_l)$ as large as possible (chosen reward >> rejected reward).
+
+<Aside type="tip">
+  **Why log-sigmoid?** The logarithm converts probabilities to log-likelihood, which is easier to optimize. The sigmoid ensures the loss is smooth and bounded.
+</Aside>
+
+### Optional: Margin Variant
+
+Some implementations add a margin $m$:
+
+$$
+\mathcal{L}_{\text{RM}} = -\mathbb{E} \left[ \log \sigma(r_\theta(x, y_w) - r_\theta(x, y_l) - m) \right]
+$$
+
+The margin encourages a **minimum difference** between chosen and rejected scores, pushing the model to be more confident.
+
+## Reward Model Architecture
+
+### Base Architecture
+
+A reward model consists of two components:
+
+```
+Input: Tokenized (prompt + response)
+        ↓
+┌──────────────────────────┐
+│   Language Model         │
+│   (GPT-2, LLaMA, etc.)   │
+│                          │
+│   Transformer layers     │
+└────────────┬─────────────┘
+             │
+             ▼ Last token hidden state
+┌──────────────────────────┐
+│   Value Head             │
+│                          │
+│   Dropout → Linear       │
+│   hidden_size → 1        │
+└────────────┬─────────────┘
+             │
+             ▼
+     Scalar Reward Score
+```
+
+### Why Last Token?
+
+We extract the **last non-padding token's** hidden state because:
+1. **Causal attention:** It has attended to all previous tokens (full context)
+2. **Response endpoint:** Represents the complete (prompt + response) sequence
+3. **Standard practice:** Matches how language models predict next tokens
+
+### Implementation Details
+
+From `src/auto_bot_tuner/rlhf/reward_model.py`:
+
+```python
+class RewardModel(nn.Module):
+    def __init__(self, base_model, freeze_base=False, dropout=0.1):
+        super().__init__()
+        self.base_model = base_model
+
+        # Freeze base model if requested
+        if freeze_base:
+            for param in self.base_model.parameters():
+                param.requires_grad = False
+
+        # Value head: hidden_size → 1 scalar
+        self.value_head = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, 1)
+        )
+
+        # Initialize with small weights for stability
+        self.value_head[1].weight.data.normal_(mean=0.0, std=0.01)
+        self.value_head[1].bias.data.zero_()
+```
+
+**Key design choices:**
+- **Dropout:** Prevents overfitting to preference data
+- **Small initialization:** Starts with near-zero scores, avoids reward hacking
+- **Optional freezing:** Can freeze base model and only train the value head
+
+## Training Procedure Overview
+
+### 1. Data Collection
+
+Collect human preferences:
+- Show annotators a prompt and two responses
+- Ask: "Which response is better?"
+- Record: `(prompt, chosen, rejected)` tuples
+
+### 2. Model Training
+
+```python
+from src.auto_bot_tuner.rlhf import (
+    create_reward_model_from_pretrained,
+    RewardModelTrainer,
+    RewardModelConfig,
+    RewardModelDataset
+)
+
+# Create reward model from SFT checkpoint
+reward_model = create_reward_model_from_pretrained(
+    "path/to/sft_model",
+    tokenizer,
+    freeze_base=False
+)
+
+# Load preference dataset
+dataset = load_dataset("Anthropic/hh-rlhf", split="train")
+train_data = RewardModelDataset(dataset, tokenizer, max_length=512)
+
+# Configure training
+config = RewardModelConfig(
+    learning_rate=1e-5,  # Lower than SFT!
+    batch_size=4,
+    num_epochs=1,
+    margin=0.0
+)
+
+# Train
+trainer = RewardModelTrainer(reward_model, tokenizer, train_data, config)
+trainer.train()
+```
+
+### 3. Evaluation
+
+Test the reward model:
+- **Accuracy:** Does chosen get higher score than rejected?
+- **Calibration:** Are score differences meaningful?
+- **Generalization:** Test on held-out comparisons
+
+### 4. Use in RLHF
+
+The trained reward model becomes the optimization objective:
+
+```python
+# During PPO training
+for prompt in prompts:
+    response = policy.generate(prompt)
+    reward = reward_model.get_rewards(prompt + response)
+    # Use reward for PPO updates...
+```
+
+## Reward Model Training: Key Considerations
+
+### Starting from SFT vs Base Model
+
+<Tabs>
+  <TabItem label="✅ Start from SFT">
+**Recommended!** The SFT model already understands instructions and generates reasonable responses.
+
+**Pros:**
+- Better initialization
+- More stable training
+- Learns to score within distribution of good responses
+
+**Cons:**
+- Inherits any SFT biases
+</TabItem>
+
+  <TabItem label="❌ Start from Base">
+**Not recommended.** Base models don't follow instructions well.
+
+**Pros:**
+- No SFT biases
+
+**Cons:**
+- Harder to train
+- May not generalize to instruction-following
+- Reward scores can be unstable
+</TabItem>
+</Tabs>
+
+### Freeze Base vs Full Fine-Tuning
+
+<CardGrid>
+  <Card title="Freeze Base Model">
+    **Approach:** Only train the value head (linear layer).
+
+    **Pros:** Fast, memory efficient, prevents forgetting
+
+    **Cons:** Limited capacity to learn new preferences
+
+    **Use when:** Small preference dataset, limited compute
+  </Card>
+
+  <Card title="Full Fine-Tuning">
+    **Approach:** Train both base model and value head.
+
+    **Pros:** Higher capacity, better performance
+
+    **Cons:** Slower, more memory, risk of overfitting
+
+    **Use when:** Large preference dataset, sufficient compute
+  </Card>
+</CardGrid>
+
+### Common Pitfalls
+
+<Aside type="caution" title="Reward Hacking">
+  **Problem:** During RL, the policy exploits the reward model's weaknesses to get high scores without actually improving.
+
+  **Solutions:**
+  - Use ensemble reward models
+  - Monitor KL divergence from reference policy
+  - Regular human evaluation
+  - Train on diverse preference data
+</Aside>
+
+<Aside type="caution" title="Overfitting">
+  **Problem:** Reward model memorizes training comparisons instead of learning general preferences.
+
+  **Solutions:**
+  - Use dropout in value head
+  - Train for only 1 epoch
+  - Monitor validation accuracy
+  - Collect more diverse data
+</Aside>
+
+<Aside type="caution" title="Distribution Mismatch">
+  **Problem:** RL generates responses outside the distribution seen during reward model training.
+
+  **Solutions:**
+  - Start RM training from SFT model
+  - Collect preference data from policy generations
+  - Iterative training (train RM, do RL, collect new preferences)
+</Aside>
+
+## Reward Models in Practice
+
+### InstructGPT (OpenAI, 2022)
+
+- **Data:** 33K comparisons from human labelers
+- **Architecture:** 6B parameter GPT-3 with value head
+- **Training:** 1 epoch, learning rate 9e-6
+- **Result:** Reward model agrees with humans 85% of the time
+
+### Claude (Anthropic, 2023)
+
+- **Data:** Mix of helpfulness and harmlessness comparisons
+- **Architecture:** Constitutional AI with preference modeling
+- **Multiple RMs:** Separate reward models for different objectives
+- **Result:** More aligned and safer than pure SFT
+
+### Key Insights from Production
+
+1. **Quality > Quantity:** 10K high-quality comparisons beats 100K noisy ones
+2. **Diverse annotators:** Different perspectives prevent bias
+3. **Clear guidelines:** Annotators need explicit criteria (helpful, harmless, honest)
+4. **Iterative improvement:** Retrain RM on policy's current distribution
+
+## Types of Reward Models
+
+### 1. Pairwise (Most Common)
+
+**Input:** (prompt, chosen, rejected)
+**Output:** Probability chosen is preferred
+**Training:** Bradley-Terry ranking loss
+
+```python
+from src.auto_bot_tuner.rlhf import compute_ranking_loss
+
+loss = compute_ranking_loss(chosen_rewards, rejected_rewards, margin=0.0)
+```
+
+### 2. Listwise
+
+**Input:** (prompt, [response1, response2, ...], [rank1, rank2, ...])
+**Output:** Ranking scores
+**Training:** ListNet or other listwise losses
+
+```python
+from src.auto_bot_tuner.rlhf import compute_listwise_loss
+
+loss = compute_listwise_loss(rewards, rankings, temperature=1.0)
+```
+
+### 3. Pointwise (Less Common)
+
+**Input:** (prompt, response, score)
+**Output:** Absolute quality score
+**Training:** Regression loss (MSE, MAE)
+
+**Downside:** Absolute scores are hard for humans to agree on. Comparisons are more reliable!
+
+### 4. Ensemble Models
+
+Combine multiple reward models to reduce variance:
+
+```python
+from src.auto_bot_tuner.rlhf import EnsembleRewardModel
+
+ensemble = EnsembleRewardModel([rm1, rm2, rm3])
+reward = ensemble(input_ids, attention_mask, aggregation="mean")
+```
+
+**Aggregation strategies:**
+- `mean`: Average rewards (most common)
+- `median`: Robust to outliers
+- `min`: Conservative (lowest score)
+- `max`: Optimistic (highest score)
+
+## Beyond Human Preferences
+
+Modern reward models can be trained on:
+
+1. **Human preferences** (gold standard)
+2. **AI preferences** (model-based labeling)
+3. **Rule-based scores** (length, toxicity, etc.)
+4. **Constitutional AI** (preference over critiques)
+5. **Multi-objective** (helpfulness + safety + conciseness)
+
+<Aside type="tip">
+  **Hybrid approach:** Start with human preferences for core behaviors, then use AI labeling to scale up and refine specific attributes.
+</Aside>
+
+## Code Example: Complete Workflow
+
+Here's a complete example from data to trained reward model:
+
+```python
+from datasets import load_dataset
+from src.auto_bot_tuner.rlhf import (
+    create_reward_model_from_pretrained,
+    RewardModelDataset,
+    RewardModelTrainer,
+    RewardModelConfig,
+    compare_responses
+)
+from src.auto_bot_tuner.utils.model_loading import load_model_and_tokenizer
+
+# 1. Load SFT model as base
+_, tokenizer, device = load_model_and_tokenizer("path/to/sft_model")
+
+# 2. Create reward model
+reward_model = create_reward_model_from_pretrained(
+    "path/to/sft_model",
+    tokenizer,
+    freeze_base=False,
+    device=device
+)
+
+# 3. Load preference data
+raw_data = load_dataset("Anthropic/hh-rlhf", split="train[:10000]")
+train_dataset = RewardModelDataset(raw_data, tokenizer, max_length=512)
+
+# 4. Configure training
+config = RewardModelConfig(
+    learning_rate=1e-5,
+    batch_size=4,
+    num_epochs=1,
+    margin=0.0,
+    output_dir="checkpoints/reward_model"
+)
+
+# 5. Train
+trainer = RewardModelTrainer(reward_model, tokenizer, train_dataset, config)
+results = trainer.train()
+
+# 6. Test the trained model
+score_a, score_b, preferred = compare_responses(
+    reward_model,
+    prompt="Explain photosynthesis.",
+    response_a="Plants use sunlight to make food through a process in their leaves.",
+    response_b="Photosynthesis is the biochemical process.",
+    tokenizer=tokenizer
+)
+
+print(f"Response A score: {score_a:.3f}")
+print(f"Response B score: {score_b:.3f}")
+print(f"Preferred: {preferred}")
+```
+
+## Next Steps
+
+Now that you understand reward models, explore:
+
+1. **[Preference Data](/reward/preference-data/)** - Dataset formats, collection, quality
+2. **[Training](/reward/training/)** - Detailed training procedure and implementation
+3. **[Evaluation](/reward/evaluation/)** - How to evaluate and debug reward models
+
+Let's dive into preference data! 📊

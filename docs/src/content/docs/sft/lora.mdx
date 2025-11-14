@@ -1,0 +1,863 @@
+---
+title: LoRA (Low-Rank Adaptation)
+description: Deep dive into LoRA theory, mathematics, and implementation for efficient fine-tuning
+---
+
+import { Aside, Card, Tabs, TabItem } from '@astrojs/starlight/components';
+
+## The Fundamental Problem
+
+Fine-tuning large language models requires updating billions of parameters:
+
+**GPT-2 (124M parameters):**
+- Model weights: 500 MB
+- Optimizer state (AdamW): 2 GB (momentum + variance)
+- Gradients: 500 MB
+- **Total: ~3 GB**
+
+**Llama 7B (7 billion parameters):**
+- Model weights: 28 GB
+- Optimizer state: 112 GB
+- Gradients: 28 GB
+- **Total: ~168 GB** (won't fit on consumer GPUs!)
+
+<Aside type="caution">
+Full fine-tuning a 7B model requires more memory than most consumer GPUs provide.
+</Aside>
+
+## The LoRA Solution
+
+**Key insight:** Model weight updates during fine-tuning are **low-rank**.
+
+Instead of updating all weights:
+
+$$
+W \in \mathbb{R}^{d \times k} \quad \text{(millions of parameters)}
+$$
+
+We learn a low-rank update:
+
+$$
+\Delta W = BA \quad \text{where } B \in \mathbb{R}^{d \times r}, A \in \mathbb{R}^{r \times k}, r \ll \min(d, k)
+$$
+
+**Memory savings:**
+
+```
+Full fine-tuning:
+  W: d × k parameters
+
+LoRA:
+  B: d × r parameters
+  A: r × k parameters
+  Total: r(d + k) parameters
+
+Reduction: d × k / (r(d + k))
+```
+
+**Example:** GPT-2 attention layer
+- Original: $W_q \in \mathbb{R}^{768 \times 768}$ = 589,824 parameters
+- LoRA (r=16): $B \in \mathbb{R}^{768 \times 16}$, $A \in \mathbb{R}^{16 \times 768}$ = 24,576 parameters
+- **24x reduction!**
+
+## Mathematical Foundation
+
+### Matrix Factorization
+
+Any matrix can be approximated by a low-rank factorization:
+
+$$
+W \approx BA
+$$
+
+Using **Singular Value Decomposition (SVD)**:
+
+$$
+W = U \Sigma V^T = \sum_{i=1}^{\min(d,k)} \sigma_i u_i v_i^T
+$$
+
+Where:
+- $\sigma_1 \geq \sigma_2 \geq ... \geq \sigma_{\min(d,k)}$ are singular values
+- $u_i$ are left singular vectors
+- $v_i$ are right singular vectors
+
+**Low-rank approximation:** Keep only top $r$ singular values:
+
+$$
+W_r = \sum_{i=1}^{r} \sigma_i u_i v_i^T
+$$
+
+**Why this works:** For many weight matrices, singular values decay rapidly:
+
+```
+σ₁ = 100.0  ← Large, important
+σ₂ = 50.0   ← Large, important
+σ₃ = 10.0   ← Medium
+σ₄ = 5.0    ← Medium
+σ₅ = 1.0    ← Small
+σ₆ = 0.5    ← Small, can ignore
+σ₇ = 0.1    ← Tiny, can ignore
+...
+```
+
+### LoRA Applied to Transformers
+
+In a transformer attention layer:
+
+$$
+h = W_0 x + \Delta W x
+$$
+
+Where:
+- $W_0$: Pre-trained weights (frozen)
+- $\Delta W$: Update to learn (full fine-tuning)
+
+With LoRA:
+
+$$
+h = W_0 x + BA x
+$$
+
+Where:
+- $W_0$: Pre-trained weights (frozen, no gradients)
+- $B, A$: Low-rank adapters (trainable)
+
+**Initialization:**
+- $A$: Random Gaussian initialization (like normal weights)
+- $B$: Zero initialization (so $BA = 0$ initially)
+
+This ensures the model starts identical to the pre-trained model.
+
+### Scaling Factor
+
+LoRA includes a scaling factor $\alpha$:
+
+$$
+h = W_0 x + \frac{\alpha}{r} BA x
+$$
+
+**Purpose:** Decouple the rank $r$ from the learning rate:
+
+- Without scaling: If you double $r$, you need to halve the learning rate
+- With scaling: $r$ can be tuned without adjusting learning rate
+
+**Typical values:** $\alpha = 2r$ (e.g., $r=16, \alpha=32$)
+
+## Implementation Deep Dive
+
+From `/home/user/autotune/src/auto_bot_tuner/utils/model_loading.py:234-262`:
+
+```python
+from peft import LoraConfig, get_peft_model, TaskType
+
+# LoRA Configuration
+lora_config = LoraConfig(
+    r=16,  # Rank of LoRA matrices
+    lora_alpha=32,  # Scaling factor (typically 2*r)
+    target_modules=["c_attn", "c_proj"],  # GPT-2 attention layers
+    lora_dropout=0.05,  # Dropout for regularization
+    bias="none",  # Don't adapt bias parameters
+    task_type=TaskType.CAUSAL_LM,  # Causal language modeling
+    fan_in_fan_out=True,  # Required for GPT-2's Conv1D layers
+)
+
+# Wrap model with LoRA adapters
+model = get_peft_model(model, lora_config)
+```
+
+### Key Parameters
+
+#### `r` (Rank)
+
+The dimensionality of the low-rank decomposition:
+
+- **r=4**: Very few parameters, may be too restrictive
+- **r=8**: Good for simple adaptations
+- **r=16**: Default, works well for most tasks
+- **r=32**: More capacity, for complex tasks
+- **r=64**: High capacity, diminishing returns
+
+**Rule of thumb:** Start with r=16. Increase if validation loss plateaus, decrease if overfitting.
+
+#### `lora_alpha` (Scaling Factor)
+
+Controls the magnitude of LoRA updates:
+
+$$
+\text{Effective learning rate for LoRA} = \text{LR} \times \frac{\alpha}{r}
+$$
+
+- $\alpha = r$: No scaling
+- $\alpha = 2r$: 2x scaling (typical)
+- $\alpha = 4r$: 4x scaling (aggressive)
+
+**Why $\alpha = 2r$?** Empirically found to work well across different ranks.
+
+<Aside type="note">
+If you change $r$, you usually don't need to change $\alpha$ or learning rate thanks to this scaling.
+</Aside>
+
+#### `target_modules`
+
+Which layers to apply LoRA to:
+
+**GPT-2 architecture:**
+```python
+target_modules=["c_attn", "c_proj"]
+```
+- `c_attn`: Combined Q, K, V projection (768 → 2304 for GPT-2)
+- `c_proj`: Output projection after attention (768 → 768)
+
+**Llama architecture:**
+```python
+target_modules=["q_proj", "k_proj", "v_proj", "o_proj"]
+```
+- `q_proj`: Query projection
+- `k_proj`: Key projection
+- `v_proj`: Value projection
+- `o_proj`: Output projection
+
+**Why attention layers?** They contain most of the model's adaptability. Adding LoRA to feedforward layers gives marginal improvements for much higher cost.
+
+<Aside type="tip">
+For aggressive fine-tuning, add `"mlp"` or `"c_fc"` to target MLP layers too. This roughly doubles trainable parameters.
+</Aside>
+
+#### `lora_dropout`
+
+Dropout applied to LoRA adapters:
+
+```python
+lora_dropout=0.05  # 5% dropout
+```
+
+**Purpose:** Regularization to prevent overfitting
+
+- 0.0: No regularization (may overfit)
+- 0.05: Light regularization (default)
+- 0.1: Moderate regularization
+- 0.2+: Heavy regularization (may underfit)
+
+#### `bias`
+
+How to handle bias parameters:
+
+- `"none"`: Don't train biases (default, most efficient)
+- `"lora_only"`: Add trainable LoRA to biases
+- `"all"`: Train all bias parameters fully
+
+**Recommendation:** Use `"none"` unless you have a specific reason.
+
+### How LoRA Modifies Layers
+
+Original layer:
+
+```python
+class Linear(nn.Module):
+    def forward(self, x):
+        return x @ self.weight.T + self.bias
+```
+
+With LoRA:
+
+```python
+class LinearWithLoRA(nn.Module):
+    def forward(self, x):
+        # Original frozen weights
+        result = x @ self.weight.T + self.bias
+
+        # Add LoRA adapters
+        if self.lora_A is not None:
+            lora_output = (x @ self.lora_A.T) @ self.lora_B.T
+            result += (self.lora_alpha / self.r) * lora_output
+
+        return result
+```
+
+**Gradient flow:**
+- `self.weight`: Frozen, no gradient
+- `self.lora_A`: Trainable, receives gradients
+- `self.lora_B`: Trainable, receives gradients
+
+## Memory Savings Analysis
+
+### Parameter Count
+
+**GPT-2 (124M parameters) with LoRA (r=16):**
+
+Attention layers in GPT-2:
+- 12 layers
+- Each has `c_attn` (768 → 2304) and `c_proj` (768 → 768)
+
+```python
+# Full fine-tuning
+c_attn_params = 768 * 2304 = 1,769,472 per layer
+c_proj_params = 768 * 768 = 589,824 per layer
+total_per_layer = 2,359,296
+total_12_layers = 28,311,552 parameters
+
+# LoRA (r=16)
+c_attn_lora = (768 * 16) + (16 * 2304) = 12,288 + 36,864 = 49,152
+c_proj_lora = (768 * 16) + (16 * 768) = 12,288 + 12,288 = 24,576
+total_per_layer = 73,728
+total_12_layers = 884,736 parameters
+
+# Reduction
+reduction = 28,311,552 / 884,736 = 32x fewer parameters!
+```
+
+**Llama 7B with LoRA (r=16):**
+
+```python
+# Attention layer: 4096 hidden size, 4 projections
+# q_proj, k_proj, v_proj, o_proj: each 4096 → 4096
+
+# Full fine-tuning
+per_layer = 4 * (4096 * 4096) = 67,108,864
+32_layers = 2,147,483,648 parameters (2.1B)
+
+# LoRA (r=16)
+per_proj = (4096 * 16) + (16 * 4096) = 131,072
+per_layer = 4 * 131,072 = 524,288
+32_layers = 16,777,216 parameters (16.7M)
+
+# Reduction
+reduction = 2,147,483,648 / 16,777,216 = 128x fewer parameters!
+```
+
+### Memory Breakdown
+
+**Llama 7B full fine-tuning:**
+```
+Model weights:        28 GB (bfloat16)
+Optimizer state:     112 GB (Adam: 2x model size in fp32)
+Gradients:            28 GB (bfloat16)
+Activations:          ~20 GB (batch size dependent)
+───────────────────────────
+Total:               ~188 GB
+```
+
+**Llama 7B with LoRA:**
+```
+Model weights:        28 GB (frozen, can be quantized)
+LoRA adapters:        33 MB (trainable)
+Optimizer state:     132 MB (only for LoRA params)
+Gradients:            33 MB (only for LoRA params)
+Activations:          ~20 GB (same as full FT)
+───────────────────────────
+Total:               ~48 GB (3.9x reduction!)
+```
+
+<Aside type="tip">
+With quantization (not shown), the base model can be loaded in 4-bit, reducing memory further to ~15 GB total!
+</Aside>
+
+## Training with LoRA
+
+### Loading Model with LoRA
+
+From `/home/user/autotune/src/auto_bot_tuner/utils/model_loading.py:183-279`:
+
+```python
+def load_model_and_tokenizer(
+    model_path: str,
+    device: Optional[str] = None,
+    use_lora: bool = False
+):
+    """
+    Load a model and tokenizer for training or inference.
+
+    Args:
+        model_path: Path to model (local path or HuggingFace ID)
+        device: Device to load model on (auto-detected if None)
+        use_lora: Whether to prepare model for LoRA training
+    """
+    if device is None:
+        device = get_device()
+
+    # Load model
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        dtype=torch.bfloat16,
+        device_map="auto",
+        low_cpu_mem_usage=True,
+    )
+
+    if use_lora:
+        from peft import LoraConfig, get_peft_model, TaskType
+
+        lora_config = LoraConfig(
+            r=16,
+            lora_alpha=32,
+            target_modules=["c_attn", "c_proj"],
+            lora_dropout=0.05,
+            bias="none",
+            task_type=TaskType.CAUSAL_LM,
+            fan_in_fan_out=True,
+        )
+
+        model = get_peft_model(model, lora_config)
+
+        # Print trainable parameters
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_pct = 100 * trainable_params / total_params
+
+        print(f"Trainable parameters: {trainable_params:,} ({trainable_pct:.2f}% of total)")
+
+    return model, tokenizer, device
+```
+
+**Example output:**
+```
+✓ LoRA adapters added
+  Trainable parameters: 884,736 (0.71% of total)
+  Total parameters: 124,439,808
+```
+
+### Training Configuration
+
+LoRA works with the same training loop, but you can use more aggressive settings:
+
+```python
+from src.auto_bot_tuner.sft import SFTConfig, SFTTrainer
+
+config = SFTConfig(
+    learning_rate=3e-4,  # Higher LR than full fine-tuning (typically 2e-5)
+    batch_size=8,        # Larger batch size (more memory available)
+    gradient_accumulation_steps=2,
+    num_epochs=5,        # More epochs (less overfitting risk)
+    warmup_steps=100,
+    max_grad_norm=1.0,
+    weight_decay=0.01,   # Standard weight decay
+    output_dir="checkpoints/gpt2-lora-sft"
+)
+
+trainer = SFTTrainer(
+    model=model,  # Model with LoRA adapters
+    tokenizer=tokenizer,
+    train_dataset=train_dataset,
+    config=config
+)
+
+trainer.train()
+```
+
+**Key differences from full fine-tuning:**
+- **Higher learning rate** (3e-4 vs 2e-5): LoRA parameters are randomly initialized, need stronger updates
+- **More epochs** (5 vs 3): Less overfitting risk with fewer trainable parameters
+- **Larger batch size** (8 vs 4): More memory available
+
+### Saving and Loading LoRA Models
+
+**Saving:**
+
+```python
+# Save LoRA adapters only (tiny!)
+model.save_pretrained("checkpoints/my-lora-model")
+tokenizer.save_pretrained("checkpoints/my-lora-model")
+```
+
+This saves:
+- `adapter_config.json`: LoRA configuration
+- `adapter_model.bin`: LoRA weights (~33 MB for GPT-2)
+- Tokenizer files
+
+**Loading:**
+
+```python
+from peft import PeftModel
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# Load base model
+base_model = AutoModelForCausalLM.from_pretrained("gpt2")
+
+# Load LoRA adapters
+model = PeftModel.from_pretrained(base_model, "checkpoints/my-lora-model")
+
+# Merge adapters into base model (optional, for deployment)
+model = model.merge_and_unload()
+```
+
+<Aside type="note">
+You can share LoRA adapters (33 MB) instead of full models (500 MB), making distribution much easier!
+</Aside>
+
+## Theoretical Insights
+
+### Why Does Low-Rank Work?
+
+**Intrinsic Dimensionality Hypothesis:**
+
+Pre-trained models have learned a rich representation space. Fine-tuning doesn't need to change everything - just a small subspace.
+
+Formally, the update $\Delta W$ lives in a low-dimensional manifold:
+
+$$
+\Delta W \in \mathcal{M} \subset \mathbb{R}^{d \times k}, \quad \dim(\mathcal{M}) = r \ll dk
+$$
+
+**Empirical evidence:**
+
+Li et al. (2018) showed fine-tuning updates have **intrinsic dimension** much smaller than parameter count:
+- BERT fine-tuning: Intrinsic dimension ~1000 out of 100M parameters
+- This means only ~1000 degrees of freedom matter!
+
+### Task Similarity and Rank
+
+Different tasks require different ranks:
+
+**Simple tasks** (e.g., classification):
+- $r = 4$ often sufficient
+- Single decision boundary to learn
+
+**Complex tasks** (e.g., instruction following):
+- $r = 16$ or higher needed
+- Multiple capabilities to adapt
+
+**Very different domains** (e.g., code → poetry):
+- $r = 64$ or even full fine-tuning
+- Large distribution shift
+
+### Comparison with Other Methods
+
+<Tabs>
+  <TabItem label="LoRA">
+**Trainable parameters:** 0.1-1% of model
+
+**Memory:** Low (only optimizer state for adapters)
+
+**Performance:** 90-95% of full fine-tuning
+
+**Pros:**
+- Very memory efficient
+- Fast training
+- Easy to share adapters
+
+**Cons:**
+- Slightly worse than full FT
+- Hyperparameter tuning needed (rank)
+</TabItem>
+
+  <TabItem label="Full Fine-Tuning">
+**Trainable parameters:** 100% of model
+
+**Memory:** High (optimizer state for all params)
+
+**Performance:** Best possible
+
+**Pros:**
+- Maximum performance
+- No hyperparameters to tune
+
+**Cons:**
+- Very high memory cost
+- Slow training
+- Risk of catastrophic forgetting
+</TabItem>
+
+  <TabItem label="Prefix Tuning">
+**Trainable parameters:** ~0.1% of model
+
+**Memory:** Low
+
+**Performance:** 80-90% of full fine-tuning
+
+**Pros:**
+- Even fewer parameters than LoRA
+- No model modification needed
+
+**Cons:**
+- Reduces effective sequence length
+- Generally worse than LoRA
+</TabItem>
+
+  <TabItem label="Adapter Layers">
+**Trainable parameters:** ~2-4% of model
+
+**Memory:** Low-Medium
+
+**Performance:** 85-95% of full fine-tuning
+
+**Pros:**
+- Good performance
+- Modular design
+
+**Cons:**
+- Adds latency (extra layers)
+- More parameters than LoRA
+</TabItem>
+</Tabs>
+
+## Hyperparameter Tuning Guide
+
+### Rank ($r$) Selection
+
+**Start with r=16**, then adjust:
+
+```
+Validation loss plateauing? → Increase rank
+  r=16 → r=32 → r=64
+
+Overfitting? → Decrease rank
+  r=16 → r=8 → r=4
+
+Can't fit in memory? → Decrease rank
+  r=16 → r=8
+```
+
+**Rule of thumb:**
+$$
+r \approx \sqrt{\frac{\text{training examples}}{1000}}
+$$
+
+Examples:
+- 1,000 examples: $r = 4$
+- 10,000 examples: $r = 16$
+- 100,000 examples: $r = 32$
+
+### Alpha ($\alpha$) Selection
+
+**Standard choice:** $\alpha = 2r$
+
+If you want to experiment:
+- $\alpha = r$: Conservative updates
+- $\alpha = 2r$: Balanced (recommended)
+- $\alpha = 4r$: Aggressive updates
+
+$$
+\text{Effective scaling} = \frac{\alpha}{r}
+$$
+
+<Aside type="tip">
+Most of the time, just use $\alpha = 2r$ and adjust learning rate instead.
+</Aside>
+
+### Learning Rate
+
+**Full fine-tuning:** 2e-5 to 5e-5
+
+**LoRA:** 1e-4 to 5e-4 (5-10x higher!)
+
+Why higher?
+- LoRA parameters are randomly initialized
+- Need stronger updates to adapt quickly
+- Less risk of catastrophic forgetting (base model frozen)
+
+**Grid search:**
+```python
+learning_rates = [1e-4, 3e-4, 5e-4, 1e-3]
+
+for lr in learning_rates:
+    config = SFTConfig(learning_rate=lr, ...)
+    trainer = SFTTrainer(...)
+    results = trainer.train()
+    print(f"LR {lr}: Final loss = {results['best_eval_loss']}")
+```
+
+### Target Modules
+
+**Minimal (fastest):**
+```python
+target_modules=["q_proj", "v_proj"]  # Only Q and V
+```
+
+**Standard (recommended):**
+```python
+target_modules=["q_proj", "k_proj", "v_proj", "o_proj"]  # All attention
+```
+
+**Aggressive (highest capacity):**
+```python
+target_modules=[
+    "q_proj", "k_proj", "v_proj", "o_proj",  # Attention
+    "gate_proj", "up_proj", "down_proj"      # MLP
+]
+```
+
+## Advanced Techniques
+
+### Rank Stabilization
+
+During training, LoRA matrices might not use the full rank efficiently. You can check the effective rank:
+
+```python
+import torch
+
+def effective_rank(matrix):
+    """Compute effective rank using singular values."""
+    U, S, V = torch.svd(matrix)
+    S_normalized = S / S.sum()
+    entropy = -(S_normalized * torch.log(S_normalized + 1e-10)).sum()
+    return torch.exp(entropy).item()
+
+# Check LoRA adapter ranks
+for name, param in model.named_parameters():
+    if "lora" in name and param.requires_grad:
+        eff_rank = effective_rank(param.data)
+        print(f"{name}: nominal rank = {param.shape[0]}, effective rank = {eff_rank:.1f}")
+```
+
+If effective rank ≪ nominal rank, consider decreasing $r$.
+
+### Multiple LoRA Adapters
+
+You can train multiple LoRA adapters for different tasks:
+
+```python
+# Task 1: Summarization
+model.load_adapter("adapters/summarization", adapter_name="summary")
+
+# Task 2: Question Answering
+model.load_adapter("adapters/qa", adapter_name="qa")
+
+# Switch tasks
+model.set_adapter("summary")  # Use summarization adapter
+output = model.generate(...)
+
+model.set_adapter("qa")       # Use QA adapter
+output = model.generate(...)
+```
+
+**Memory:** Each adapter is only 33 MB, so you can keep many in memory!
+
+### LoRA Composition
+
+Combine multiple LoRA adapters:
+
+```python
+# Train on general instructions
+lora_general = train_lora(dataset="alpaca")
+
+# Train on code
+lora_code = train_lora(dataset="code")
+
+# Combine: 50% general + 50% code
+combined_lora = 0.5 * lora_general + 0.5 * lora_code
+```
+
+This can create adapters for hybrid tasks without retraining!
+
+## When to Use LoRA vs Full Fine-Tuning
+
+### Use LoRA When:
+
+1. **Memory constrained**: GPU has &lt;24 GB VRAM
+2. **Quick iteration**: Need to try many experiments
+3. **Multiple tasks**: Want task-specific adapters
+4. **Distribution**: Need to share models (adapters are tiny)
+5. **Large models**: Training 7B+ parameters
+
+### Use Full Fine-Tuning When:
+
+1. **Maximum performance**: Every 0.1% accuracy matters
+2. **Sufficient resources**: Have 80+ GB VRAM
+3. **Large distribution shift**: Task very different from pre-training
+4. **Simple deployment**: Don't want adapter complexity
+
+### Hybrid Approach
+
+1. Start with LoRA for quick iteration
+2. Find best hyperparameters
+3. Do one full fine-tuning run with those hyperparameters
+
+This combines speed of LoRA with performance of full fine-tuning!
+
+## Common Pitfalls
+
+### Pitfall 1: Using Same LR as Full Fine-Tuning
+
+```python
+# Bad - LR too low for LoRA
+config = SFTConfig(learning_rate=2e-5)  # Full FT learning rate
+
+# Good - Higher LR for LoRA
+config = SFTConfig(learning_rate=3e-4)  # 15x higher!
+```
+
+### Pitfall 2: Rank Too Small
+
+```
+Training loss: 2.5 → 2.0 → 1.8 → 1.7 → 1.65 → 1.64 → 1.64 → ...
+                                                    ↑ Stuck!
+```
+
+**Solution:** Increase rank from 8 to 16 or 32.
+
+### Pitfall 3: Wrong Target Modules
+
+```python
+# Bad - Wrong module names for your model
+target_modules=["c_attn", "c_proj"]  # GPT-2 names, won't work for Llama!
+
+# Good - Check your model's layer names first
+print(model)  # See actual layer names
+target_modules=["q_proj", "k_proj", "v_proj", "o_proj"]  # Llama names
+```
+
+### Pitfall 4: Not Merging for Deployment
+
+```python
+# Development: Base model + adapter (requires PEFT library)
+model = PeftModel.from_pretrained(base_model, "adapter_path")
+
+# Production: Merge adapter into base (standard HF model)
+model = model.merge_and_unload()
+model.save_pretrained("merged_model")
+```
+
+Merged models are faster and don't require PEFT library!
+
+## Summary
+
+LoRA enables efficient fine-tuning through low-rank adaptation:
+
+**Key idea:**
+$$
+h = W_0 x + \frac{\alpha}{r} BA x
+$$
+- $W_0$: Frozen pre-trained weights
+- $B, A$: Low-rank adapters (trainable)
+- $r$: Rank (typically 8-32)
+- $\alpha$: Scaling factor (typically 2r)
+
+**Memory savings:**
+- **GPT-2:** 32x fewer parameters
+- **Llama 7B:** 128x fewer parameters, 4x less memory
+
+**Hyperparameters:**
+- `r=16`: Standard rank
+- `lora_alpha=32`: Standard scaling (2r)
+- `learning_rate=3e-4`: Higher than full FT
+- `target_modules=["c_attn", "c_proj"]`: Attention layers
+
+**Trade-offs:**
+- ✓ 90-95% of full fine-tuning performance
+- ✓ Much faster and cheaper
+- ✓ Easy to share and combine
+- ✗ Slightly worse than full FT
+- ✗ Extra hyperparameter (rank) to tune
+
+**When to use:**
+- Memory constrained (&lt;24 GB VRAM)
+- Training large models (7B+)
+- Quick iteration needed
+- Multiple task-specific models
+
+**Implementation:**
+```python
+from src.auto_bot_tuner.utils.model_loading import load_model_and_tokenizer
+
+# Load model with LoRA
+model, tokenizer, device = load_model_and_tokenizer(
+    "gpt2",
+    use_lora=True
+)
+
+# Train normally - LoRA is transparent to training loop!
+trainer = SFTTrainer(model=model, ...)
+trainer.train()
+```
+
+LoRA democratizes LLM fine-tuning, making it accessible on consumer hardware!
+

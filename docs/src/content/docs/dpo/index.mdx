@@ -1,0 +1,473 @@
+---
+title: Introduction to Direct Preference Optimization (DPO)
+description: Learn DPO - a simpler, more stable alternative to RLHF that directly optimizes language models using preferences
+---
+
+import { Card, CardGrid, Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+## What is Direct Preference Optimization?
+
+**Direct Preference Optimization (DPO)** is a breakthrough algorithm that teaches language models to align with human preferences **without requiring reinforcement learning or reward models**. It's simpler, more stable, and often more effective than traditional RLHF.
+
+<Aside type="tip" title="The Key Insight">
+  **Your language model is secretly a reward model!** DPO reparameterizes the reward model to extract it directly from the policy, eliminating the need for a separate RL training phase.
+</Aside>
+
+### The Problem with RLHF
+
+Traditional RLHF requires a complex three-stage pipeline:
+
+```
+1. Supervised Fine-Tuning (SFT)
+   ↓
+2. Train Reward Model on preferences
+   ↓
+3. RL training (PPO) using reward model
+```
+
+**Stage 3 is notoriously difficult:**
+- PPO is unstable and requires careful tuning
+- Reward hacking: policy exploits reward model weaknesses
+- Requires 4 models in memory (policy, reference, reward, value)
+- Distribution mismatch between reward model training and RL
+- Sensitive to hyperparameters (clip ratio, KL penalty, etc.)
+
+### DPO's Elegant Solution
+
+DPO eliminates Stage 2 and 3, directly optimizing preferences:
+
+```
+1. Supervised Fine-Tuning (SFT)
+   ↓
+2. DPO training on preferences ✨
+   ↓
+Done! 🎉
+```
+
+**How is this possible?** DPO discovered that the optimal reward model can be analytically expressed in terms of the optimal policy. By reparameterizing, we can optimize the policy directly!
+
+## The Mathematical Insight
+
+### Step 1: The RLHF Objective
+
+Traditional RLHF maximizes expected reward while staying close to a reference policy:
+
+$$
+\max_{\pi_\theta} \mathbb{E}_{x \sim D, y \sim \pi_\theta(y|x)} \left[ r(x, y) \right] - \beta \cdot D_{KL}(\pi_\theta(y|x) \| \pi_{\text{ref}}(y|x))
+$$
+
+where:
+- $\pi_\theta$ is the policy we're training
+- $r(x, y)$ is the reward model
+- $\beta$ controls how much we penalize deviation from reference
+- $\pi_{\text{ref}}$ is the initial SFT model (frozen)
+
+### Step 2: Optimal Policy Has Closed Form!
+
+The solution to this optimization problem is:
+
+$$
+\pi^*(y|x) = \frac{1}{Z(x)} \pi_{\text{ref}}(y|x) \exp\left(\frac{1}{\beta} r(x, y)\right)
+$$
+
+where $Z(x) = \sum_y \pi_{\text{ref}}(y|x) \exp\left(\frac{1}{\beta} r(x, y)\right)$ is the partition function.
+
+<Aside type="note">
+  This is a fundamental result from information theory. The optimal policy is the reference policy, adjusted by the exponentiated reward, normalized to be a valid probability distribution.
+</Aside>
+
+### Step 3: Reparameterize to Extract Reward
+
+Rearranging the optimal policy equation:
+
+$$
+r(x, y) = \beta \log \frac{\pi^*(y|x)}{\pi_{\text{ref}}(y|x)} + \beta \log Z(x)
+$$
+
+**Key insight:** The reward is just the log ratio of policy to reference, plus a constant (partition function) that doesn't depend on $y$!
+
+### Step 4: Bradley-Terry Preference Model
+
+Human preferences follow the Bradley-Terry model:
+
+$$
+P(y_w \succ y_l | x) = \frac{\exp(r(x, y_w))}{\exp(r(x, y_w)) + \exp(r(x, y_l))} = \sigma(r(x, y_w) - r(x, y_l))
+$$
+
+where:
+- $y_w$ is the chosen (winner) response
+- $y_l$ is the rejected (loser) response
+- $\sigma$ is the sigmoid function
+
+### Step 5: Substitute the Reparameterized Reward
+
+Substituting our reward expression from Step 3:
+
+$$
+P(y_w \succ y_l | x) = \sigma\left(\beta \log \frac{\pi_\theta(y_w|x)}{\pi_{\text{ref}}(y_w|x)} - \beta \log \frac{\pi_\theta(y_l|x)}{\pi_{\text{ref}}(y_l|x)}\right)
+$$
+
+Notice: **The partition function $Z(x)$ cancels out!** It appeared in both $r(x, y_w)$ and $r(x, y_l)$, and their difference eliminates it.
+
+### Step 6: The DPO Loss Function
+
+The DPO loss maximizes the log-likelihood of observed preferences:
+
+$$
+\mathcal{L}_{\text{DPO}}(\pi_\theta) = -\mathbb{E}_{(x,y_w,y_l) \sim D} \left[ \log \sigma\left(\beta \log \frac{\pi_\theta(y_w|x)}{\pi_{\text{ref}}(y_w|x)} - \beta \log \frac{\pi_\theta(y_l|x)}{\pi_{\text{ref}}(y_l|x)}\right) \right]
+$$
+
+**This is beautiful!** We can optimize the policy directly using only:
+1. The policy model $\pi_\theta$ (being trained)
+2. The reference model $\pi_{\text{ref}}$ (frozen SFT model)
+3. Preference data $(x, y_w, y_l)$
+
+No reward model! No PPO! Just supervised learning on preferences!
+
+## Why This is Revolutionary
+
+<CardGrid>
+  <Card title="Simplicity" icon="approve-check">
+    **1 training phase instead of 2.** No reward model, no RL. Just maximize preference likelihood like supervised learning.
+  </Card>
+
+  <Card title="Stability" icon="rocket">
+    **No PPO instabilities.** DPO is supervised learning—no value functions, no clipping, no advantage estimation. Much more stable.
+  </Card>
+
+  <Card title="Memory Efficiency" icon="laptop">
+    **2 models instead of 4.** Only need policy + reference. RLHF needs policy + reference + reward + value network.
+  </Card>
+
+  <Card title="No Reward Hacking" icon="shield">
+    **No separate reward model to exploit.** Policy is optimized on actual preferences, not a proxy.
+  </Card>
+
+  <Card title="Sample Efficiency" icon="star">
+    **Better data utilization.** Every preference directly updates the policy. RLHF uses preferences to train RM, then uses RM to train policy (indirect).
+  </Card>
+
+  <Card title="Hyperparameter Simplicity" icon="setting">
+    **Just β (beta).** RLHF has clip_ratio, kl_coef, vf_coef, entropy_coef, gamma, lambda, etc.
+  </Card>
+</CardGrid>
+
+## The Implicit Reward
+
+Even though DPO doesn't train a reward model, we can still extract an **implicit reward** from the trained policy:
+
+$$
+r_{\text{implicit}}(x, y) = \beta \log \frac{\pi_\theta(y|x)}{\pi_{\text{ref}}(y|x)}
+$$
+
+This tells us how much better the policy thinks response $y$ is compared to what the reference model would generate.
+
+<Aside type="tip">
+  During training, we monitor these implicit rewards to ensure chosen responses get higher rewards than rejected ones. This is analogous to monitoring reward model accuracy in RLHF.
+</Aside>
+
+## How DPO Training Works
+
+### The Training Loop
+
+```python
+for batch in preference_data:
+    # 1. Forward pass: policy model
+    policy_chosen_logps = policy(prompt + chosen)
+    policy_rejected_logps = policy(prompt + rejected)
+
+    # 2. Forward pass: reference model (frozen, no gradients)
+    with torch.no_grad():
+        ref_chosen_logps = reference(prompt + chosen)
+        ref_rejected_logps = reference(prompt + rejected)
+
+    # 3. Compute DPO loss
+    chosen_reward = beta * (policy_chosen_logps - ref_chosen_logps)
+    rejected_reward = beta * (policy_rejected_logps - ref_rejected_logps)
+    loss = -log_sigmoid(chosen_reward - rejected_reward)
+
+    # 4. Backprop and update (only policy model)
+    loss.backward()
+    optimizer.step()
+```
+
+**That's it!** No reward model training, no PPO, no value functions.
+
+### Key Components
+
+1. **Policy Model ($\pi_\theta$)**: The model being trained. Starts as SFT model.
+2. **Reference Model ($\pi_{\text{ref}}$)**: Frozen copy of initial policy. Prevents model from drifting too far.
+3. **Beta ($\beta$)**: Temperature parameter controlling KL penalty strength.
+4. **Preference Data**: Triples of (prompt, chosen response, rejected response).
+
+## Comparison: RLHF vs DPO
+
+| Aspect | RLHF (PPO) | DPO |
+|--------|-----------|-----|
+| **Training Phases** | 3 (SFT → RM → PPO) | 2 (SFT → DPO) |
+| **Models Required** | 4 (policy, ref, reward, value) | 2 (policy, ref) |
+| **Algorithm Type** | Reinforcement Learning | Supervised Learning |
+| **Stability** | Often unstable | Very stable |
+| **Hyperparameters** | Many (10+) | Few (mainly β) |
+| **Sample Efficiency** | Lower (indirect) | Higher (direct) |
+| **Reward Hacking Risk** | High | Low |
+| **Memory Usage** | ~4x model size | ~2x model size |
+| **Training Speed** | Slower (2 phases) | Faster (1 phase) |
+| **Flexibility** | Can use external rewards | Limited to preferences |
+
+<Aside type="note">
+  **When to use RLHF:** When you have a well-defined reward function (e.g., task success rate, code execution, tool use). DPO requires preference comparisons.
+
+  **When to use DPO:** For alignment, helpfulness, harmlessness, and other subjective qualities where preferences are easier to collect than rewards.
+</Aside>
+
+## Practical Considerations
+
+### Starting Point: SFT is Essential
+
+Both RLHF and DPO require starting from an **SFT model**, not a base model:
+
+```
+❌ Base Model → DPO Training
+✅ Base Model → SFT → DPO Training
+```
+
+**Why?** DPO (like RLHF) assumes the model already follows instructions. Preference learning refines behavior, it doesn't teach basic instruction-following.
+
+### Beta Parameter Effects
+
+The $\beta$ parameter controls the KL penalty strength:
+
+**Small $\beta$ (e.g., 0.05):**
+- Weak KL constraint
+- Policy can diverge significantly from reference
+- Higher risk of overfitting or mode collapse
+- More aggressive alignment
+
+**Large $\beta$ (e.g., 0.5):**
+- Strong KL constraint
+- Policy stays close to reference
+- More conservative, stable training
+- Less aggressive alignment
+
+**Typical values:** $\beta \in [0.1, 0.5]$, with 0.1 being most common.
+
+### Label Smoothing
+
+Standard DPO assumes preferences are perfect: $P(y_w \succ y_l) = 1$.
+
+With label smoothing ($\epsilon$):
+
+$$
+P_{\text{smooth}}(y_w \succ y_l) = (1 - \epsilon) \cdot 1 + \epsilon \cdot 0.5 = 1 - \frac{\epsilon}{2}
+$$
+
+This makes training more robust to noisy or ambiguous preferences:
+
+```python
+# Without label smoothing (standard DPO)
+loss = -log_sigmoid(logits)
+
+# With label smoothing (robust DPO)
+loss = -(1 - eps) * log_sigmoid(logits) - eps * log_sigmoid(-logits)
+```
+
+**Typical values:** $\epsilon \in [0, 0.3]$, with 0.0 (no smoothing) being most common.
+
+## The Original DPO Paper
+
+The DPO algorithm was introduced in:
+
+**"Direct Preference Optimization: Your Language Model is Secretly a Reward Model"**
+Rafael Rafailov, Archit Sharma, Eric Mitchell, Stefano Ermon, Christopher D. Manning, Chelsea Finn
+*NeurIPS 2023*
+📄 [arXiv:2305.18290](https://arxiv.org/abs/2305.18290)
+
+### Key Contributions
+
+1. **Theoretical:** Showed that the optimal reward model can be reparameterized in terms of the optimal policy
+2. **Practical:** Demonstrated DPO matches or outperforms PPO-based RLHF
+3. **Efficiency:** Achieved same results with 2x less training time and 2x less memory
+
+### Experimental Results
+
+From the paper (on Anthropic HH-RLHF dataset):
+
+| Method | Win Rate vs SFT | Training Time | Memory Usage |
+|--------|-----------------|---------------|--------------|
+| SFT Baseline | — | 1x | 1x |
+| PPO (RLHF) | **75%** | 3x | 4x |
+| DPO | **76%** | 1.5x | 2x |
+
+**DPO matched RLHF performance while being 2x faster and using 2x less memory!**
+
+## When DPO Might Not Be Ideal
+
+While DPO is simpler and often better than RLHF, there are cases where RLHF might be preferred:
+
+<CardGrid>
+  <Card title="Non-Binary Preferences">
+    **Challenge:** DPO is designed for pairwise preferences (A > B).
+
+    **RLHF advantage:** Reward models can be trained on scalar scores or rankings, then used in RL.
+  </Card>
+
+  <Card title="External Reward Functions">
+    **Challenge:** DPO requires preference data, not external metrics.
+
+    **RLHF advantage:** Can optimize for code execution success, task completion, tool use accuracy, etc.
+  </Card>
+
+  <Card title="Continual Learning">
+    **Challenge:** DPO requires retraining on full preference dataset.
+
+    **RLHF advantage:** Can collect new preferences, update RM, then fine-tune policy incrementally.
+  </Card>
+
+  <Card title="Multi-Objective Optimization">
+    **Challenge:** DPO optimizes single preference signal.
+
+    **RLHF advantage:** Can use multiple reward models (helpfulness + safety) and combine with weighted objectives.
+  </Card>
+</CardGrid>
+
+That said, DPO extensions address many of these limitations (e.g., IPO for iterative learning, multi-objective DPO variants).
+
+## Code Example: Complete DPO Training
+
+Here's how to train a model with DPO:
+
+```python
+from datasets import load_dataset
+from src.auto_bot_tuner.dpo import (
+    DPOTrainer,
+    DPOConfig,
+    PreferenceDataset,
+    create_reference_model
+)
+from src.auto_bot_tuner.utils.model_loading import load_model_and_tokenizer
+
+# 1. Load SFT model (starting point for DPO)
+policy_model, tokenizer, device = load_model_and_tokenizer(
+    "path/to/sft_model",
+    use_lora=True  # Efficient fine-tuning
+)
+
+# 2. Create frozen reference model (copy of initial policy)
+reference_model = create_reference_model(policy_model, device)
+
+# 3. Load preference dataset
+raw_data = load_dataset("Anthropic/hh-rlhf", split="train")
+train_dataset = PreferenceDataset(
+    raw_data,
+    tokenizer,
+    max_length=512
+)
+
+# 4. Configure DPO training
+config = DPOConfig(
+    beta=0.1,                # KL penalty strength
+    label_smoothing=0.0,     # No label smoothing
+    learning_rate=5e-7,      # Lower than SFT
+    batch_size=4,
+    num_epochs=1,            # Usually 1 epoch is enough
+    output_dir="checkpoints/dpo"
+)
+
+# 5. Train!
+trainer = DPOTrainer(
+    policy_model=policy_model,
+    reference_model=reference_model,
+    tokenizer=tokenizer,
+    train_dataset=train_dataset,
+    config=config
+)
+
+results = trainer.train()
+
+print(f"Training completed in {results['total_steps']} steps")
+print(f"Best validation accuracy: {results['best_eval_accuracy']:.3f}")
+```
+
+## Expected Training Metrics
+
+During DPO training, monitor these key metrics:
+
+### 1. Loss (Primary Metric)
+
+**What it is:** Negative log-likelihood of preference correctness
+
+**Typical values:**
+- Start: ~0.69 (random: 50% accuracy → -log(0.5) ≈ 0.69)
+- Converged: ~0.3-0.5
+
+**What to watch:**
+- Steady decrease = good learning
+- Plateau = converged or need more data
+- Increase = overfitting or too large learning rate
+
+### 2. Accuracy (Most Intuitive)
+
+**What it is:** Fraction of examples where chosen gets higher reward than rejected
+
+**Typical values:**
+- Start: ~50% (random, before training)
+- After training: 65-80%
+- Over 90%: Possible overfitting or easy data
+
+**What to watch:**
+- Train/val gap < 5%: Good generalization
+- Train/val gap > 15%: Overfitting
+
+### 3. Reward Margin
+
+**What it is:** Average difference between chosen and rejected implicit rewards
+
+**Typical values:**
+- Start: ~0 (policy = reference initially)
+- After training: 1-5 (depending on β)
+
+**What to watch:**
+- Increasing margin = policy learning to distinguish
+- Margin too large (>10) = possible divergence
+
+### 4. KL Divergence
+
+**What it is:** How much the policy has diverged from reference
+
+**Typical values:**
+- Start: ~0 (policy = reference initially)
+- After training: 0.1-2.0 (depending on β)
+
+**What to watch:**
+- Steady increase = expected
+- Sudden spikes = instability, reduce learning rate
+- Very high (>10) = policy has diverged too much
+
+## DPO Training Tips
+
+<Aside type="tip" title="Start Small">
+  Begin with a small preference dataset (1K-10K examples) to verify your pipeline works. DPO is sample-efficient—you don't need millions of preferences!
+</Aside>
+
+<Aside type="tip" title="Lower Learning Rate">
+  Use 10x lower learning rate than SFT (e.g., 5e-7 instead of 5e-6). DPO is more sensitive to learning rate than SFT.
+</Aside>
+
+<Aside type="tip" title="1 Epoch Usually Enough">
+  Unlike SFT where 3-5 epochs is common, DPO often works best with just 1 epoch. More epochs risk overfitting.
+</Aside>
+
+<Aside type="caution" title="Reference Model Must Match">
+  The reference model should be the **exact same weights** as the initial policy model. Don't use a different checkpoint or SFT run!
+</Aside>
+
+## Next Steps
+
+Now that you understand DPO fundamentals, explore:
+
+1. **[DPO vs RLHF](/dpo/vs-rlhf/)** - Detailed comparison with empirical results
+2. **[Loss Function](/dpo/loss/)** - Deep dive into DPO loss implementation
+3. **[Training](/dpo/training/)** - Complete training procedure and troubleshooting
+
+Let's compare DPO with RLHF in detail! 🚀

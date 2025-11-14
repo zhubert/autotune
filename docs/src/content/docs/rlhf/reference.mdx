@@ -1,0 +1,833 @@
+---
+title: Reference Models in RLHF
+description: Understanding frozen reference models, creation, memory considerations, and when reference diverges
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+## What is a Reference Model?
+
+A **reference model** in RLHF is a **frozen copy** of the initial policy (the SFT model) that serves as an anchor point during RL training. It never gets updated and is used solely for computing the KL divergence penalty.
+
+<Aside type="note">
+  The reference model is arguably the most important stability mechanism in RLHF. Without it, the policy would quickly drift into nonsensical behavior that exploits reward model weaknesses.
+</Aside>
+
+```python
+# At the start of RL training
+reference_model = copy.deepcopy(sft_model)
+reference_model.eval()
+for param in reference_model.parameters():
+    param.requires_grad = False
+
+# Reference model NEVER changes after this point!
+```
+
+## Why We Need Reference Models
+
+### The Distribution Shift Problem
+
+Without a reference model, the policy optimizes:
+
+$$
+\max_\theta \mathbb{E}_{\tau \sim \pi_\theta} [R(\tau)]
+$$
+
+**Problem:** The policy can drift arbitrarily far from the initial SFT distribution.
+
+**Consequences:**
+1. **Reward hacking:** Policy finds adversarial examples that exploit reward model bugs
+2. **Incoherent generation:** Policy generates text unlike training data (reward model confused)
+3. **Loss of capabilities:** Policy forgets skills learned during SFT (mode collapse)
+4. **Optimization collapse:** Policy converges to degenerate solution (same response for all prompts)
+
+### The Solution: KL Penalty
+
+With a reference model, we optimize:
+
+$$
+\max_\theta \mathbb{E}_{\tau \sim \pi_\theta} \left[ R(\tau) - \beta \cdot D_{\text{KL}}(\pi_\theta \| \pi_{\text{ref}}) \right]
+$$
+
+**Effect:** Policy is rewarded for high scores but penalized for deviating from reference.
+
+**Mathematical interpretation:**
+
+The KL penalty term can be rewritten as:
+
+$$
+\mathbb{E}_{s,a \sim \pi_\theta} \left[ \log \pi_\theta(a|s) - \log \pi_{\text{ref}}(a|s) \right]
+$$
+
+This penalizes the policy for assigning **higher probability to actions than the reference does**.
+
+**Intuition:** "You can improve, but stay close to what you learned during SFT."
+
+## Creating a Reference Model
+
+From [`src/auto_bot_tuner/rlhf/ppo_trainer.py`](https://github.com/yourusername/autotune/blob/main/src/auto_bot_tuner/rlhf/ppo_trainer.py):
+
+```python
+import copy
+
+def create_reference_model(policy_model: torch.nn.Module) -> torch.nn.Module:
+    """
+    Create a frozen copy of the policy model to use as reference.
+
+    Args:
+        policy_model: The policy model to copy
+
+    Returns:
+        Frozen reference model
+
+    Educational Note:
+        The reference model is a deep copy of the initial policy (SFT model).
+        It's frozen (all parameters have requires_grad=False) and never updated.
+        This preserves the initial distribution for KL penalty computation.
+    """
+    # Deep copy: Creates independent copy with separate memory
+    reference_model = copy.deepcopy(policy_model)
+
+    # Set to evaluation mode
+    reference_model.eval()
+
+    # Freeze all parameters
+    for param in reference_model.parameters():
+        param.requires_grad = False
+
+    return reference_model
+```
+
+### Why Deep Copy?
+
+**Shallow copy** (wrong!):
+```python
+# DON'T DO THIS!
+reference_model = policy_model  # Just assigns reference
+# Both variables point to same model in memory
+# Updating policy_model ALSO updates reference_model
+```
+
+**Deep copy** (correct!):
+```python
+# DO THIS!
+reference_model = copy.deepcopy(policy_model)
+# Creates completely independent copy
+# Updating policy_model doesn't affect reference_model
+```
+
+### Verifying the Copy
+
+Always verify that reference and policy are truly independent:
+
+```python
+# After creating reference model
+print("Verifying independence...")
+
+# Get parameter from each model
+policy_param = next(policy_model.parameters())
+ref_param = next(reference_model.parameters())
+
+# Check values are initially equal
+assert torch.allclose(policy_param, ref_param), "Initial values should match!"
+
+# Check they're not the same tensor
+assert policy_param.data_ptr() != ref_param.data_ptr(), \
+    "Parameters should be in different memory locations!"
+
+# Update policy
+optimizer.zero_grad()
+loss.backward()
+optimizer.step()
+
+# Check reference unchanged
+ref_param_after = next(reference_model.parameters())
+assert torch.equal(ref_param, ref_param_after), \
+    "Reference model should not change!"
+
+print("✓ Reference model is properly frozen and independent")
+```
+
+## Memory Considerations
+
+### Memory Usage
+
+Each model requires memory for:
+1. **Parameters:** Model weights (e.g., 124M for GPT-2)
+2. **Activations:** Intermediate computations during forward pass
+3. **Gradients:** (Only for trainable models)
+4. **Optimizer states:** (Only for trainable models)
+
+For a typical RLHF setup with GPT-2:
+
+| Model | Parameters | Gradients | Optimizer | Total |
+|-------|-----------|-----------|-----------|-------|
+| **Policy** | 500 MB | 500 MB | 1000 MB | **2000 MB** |
+| **Value Network** | 500 MB | 500 MB | 1000 MB | **2000 MB** |
+| **Reference** | 500 MB | ❌ 0 MB | ❌ 0 MB | **500 MB** |
+| **Reward** | 500 MB | ❌ 0 MB | ❌ 0 MB | **500 MB** |
+| **Total** | | | | **5000 MB (~5 GB)** |
+
+**Observation:** Reference and reward models each use only 1/4 the memory of trainable models!
+
+### Memory Optimization Strategies
+
+#### 1. CPU Offloading
+
+Move frozen models to CPU during training:
+
+```python
+# Policy and value: GPU (need fast gradients)
+policy_model = policy_model.to("cuda")
+value_network = value_network.to("cuda")
+
+# Reference and reward: CPU (frozen, slower OK)
+reference_model = reference_model.to("cpu")
+reward_model = reward_model.to("cpu")
+
+# During rollout generation
+with torch.no_grad():
+    # Move data to CPU for reference model
+    ref_logprobs = reference_model(
+        input_ids.cpu(),
+        attention_mask.cpu()
+    )
+    ref_logprobs = ref_logprobs.to("cuda")  # Move results back
+```
+
+**Trade-off:**
+- ✅ Saves GPU memory (can use larger batch sizes)
+- ❌ Slower (CPU-GPU transfers, slower computation)
+
+**Recommendation:** Only offload if GPU memory is a bottleneck.
+
+#### 2. Mixed Precision
+
+Use FP16 for frozen models:
+
+```python
+# Policy and value: FP32 (stable training)
+policy_model = policy_model.float()
+value_network = value_network.float()
+
+# Reference and reward: FP16 (inference only, saves memory)
+reference_model = reference_model.half()
+reward_model = reward_model.half()
+
+# During inference
+with torch.no_grad():
+    # Reference model uses FP16
+    ref_outputs = reference_model(
+        input_ids.to(dtype=torch.float16)
+    )
+    # Convert back to FP32 for loss computation
+    ref_logprobs = ref_outputs.logits.float()
+```
+
+**Benefits:**
+- 2x memory reduction for frozen models
+- Faster inference (on modern GPUs)
+- Minimal accuracy loss (inference only)
+
+#### 3. Shared Base Models
+
+For extreme memory constraints, share the base model:
+
+```python
+# Policy uses full model
+policy_model = GPT2LMHeadModel.from_pretrained("gpt2")
+
+# Value network shares the base, only adds head
+value_network = ValueNetwork(
+    base_model=policy_model.transformer,  # Share base!
+    freeze_base=True  # Don't update base through value network
+)
+
+# Reference: Still needs separate copy
+reference_model = copy.deepcopy(policy_model)
+```
+
+**Caveat:** Policy base will update during training, affecting value network. Works if value network freezes base.
+
+### Memory Profiling
+
+Track memory usage during training:
+
+```python
+import torch
+
+def print_memory_stats():
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1e9
+        reserved = torch.cuda.memory_reserved() / 1e9
+        print(f"GPU Memory: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved")
+
+# Before training
+print("Initial:")
+print_memory_stats()
+
+# After loading models
+policy_model = policy_model.to("cuda")
+value_network = value_network.to("cuda")
+reference_model = reference_model.to("cuda")
+reward_model = reward_model.to("cuda")
+print("\nAfter loading models:")
+print_memory_stats()
+
+# During training
+for step in training_loop:
+    loss.backward()
+    optimizer.step()
+
+    if step % 10 == 0:
+        print(f"\nStep {step}:")
+        print_memory_stats()
+```
+
+## Using the Reference Model
+
+### During Rollout Generation
+
+```python
+@torch.no_grad()
+def generate_rollout(self, prompt_batch):
+    """Generate rollout with policy and reference models."""
+
+    # Generate with policy
+    outputs = self.policy_model.generate(
+        input_ids=prompt_batch["input_ids"],
+        max_new_tokens=128,
+        do_sample=True
+    )
+
+    generated_ids = outputs.sequences
+
+    # Get policy log probabilities
+    policy_outputs = self.policy_model(generated_ids)
+    policy_logits = policy_outputs.logits
+    policy_logprobs = get_logprobs(policy_logits, generated_ids)
+
+    # Get reference log probabilities
+    ref_outputs = self.reference_model(generated_ids)
+    ref_logits = ref_outputs.logits
+    ref_logprobs = get_logprobs(ref_logits, generated_ids)
+
+    # Reference log probs stored for later
+    return {
+        "responses": generated_ids,
+        "policy_logprobs": policy_logprobs,
+        "ref_logprobs": ref_logprobs,  # ← Used in loss
+        # ...
+    }
+```
+
+**Key point:** Reference log probs are computed once during rollout and reused across all PPO epochs.
+
+### During PPO Update
+
+```python
+for epoch in range(ppo_epochs):
+    # Re-compute policy log probs (policy updated)
+    policy_outputs = self.policy_model(full_input_ids)
+    policy_logprobs = get_logprobs(policy_outputs.logits, response_ids)
+
+    # Reference log probs from rollout (unchanged!)
+    ref_logprobs = rollout_data["ref_logprobs"]
+
+    # Compute loss with KL penalty
+    loss = compute_ppo_total_loss(
+        policy_logprobs=policy_logprobs,      # ← Changes each epoch
+        ref_logprobs=ref_logprobs,            # ← Fixed
+        advantages=advantages,
+        kl_coef=0.1
+    )
+
+    loss.backward()
+    optimizer.step()
+```
+
+**Why recompute policy but not reference?**
+- Policy parameters change each epoch → log probs change
+- Reference parameters frozen → log probs stay same
+
+## When Reference Models Diverge
+
+### Normal Divergence
+
+Some divergence is expected and healthy:
+
+```
+Step 10:  KL = 0.02  (small change, good)
+Step 20:  KL = 0.04  (moderate change, good)
+Step 50:  KL = 0.06  (larger change, still OK)
+Step 100: KL = 0.08  (approaching limit)
+```
+
+**Interpretation:** Policy is improving while staying reasonably close to reference.
+
+### Problematic Divergence
+
+```
+Step 10:  KL = 0.05  (normal)
+Step 20:  KL = 0.15  (too high!)
+Step 30:  KL = 0.35  (critical!)
+Step 40:  KL = 0.80  (complete divergence!)
+```
+
+**Signs of trouble:**
+- KL > 0.1 consistently
+- KL increasing rapidly
+- Generated text becoming incoherent
+- Reward model scores becoming unreliable
+
+### Recovery Strategies
+
+#### 1. Increase KL Coefficient
+
+```python
+# Was too low
+config.kl_coef = 0.1
+
+# Increase to constrain policy more
+config.kl_coef = 0.5
+
+# Or implement adaptive adjustment
+if kl_divergence > 0.1:
+    config.kl_coef *= 1.5
+```
+
+#### 2. Decrease Learning Rate
+
+```python
+# Policy changing too fast
+config.learning_rate = 1e-6  # was 5e-6
+
+# Slower updates = more controlled divergence
+```
+
+#### 3. Reduce PPO Epochs
+
+```python
+# Too many epochs on same rollout
+config.ppo_epochs = 4  # was 8
+
+# Fewer epochs = less distribution mismatch
+```
+
+#### 4. Restart from Checkpoint
+
+If divergence is severe:
+
+```python
+# Load last good checkpoint
+policy_model = load_checkpoint("step_50")
+
+# Create new reference from this checkpoint
+reference_model = create_reference_model(policy_model)
+
+# Continue training with adjusted hyperparameters
+config.kl_coef = 0.3  # More conservative
+config.learning_rate = 5e-7  # Slower
+```
+
+### Monitoring Divergence
+
+```python
+# During training
+def check_divergence(policy_logprobs, ref_logprobs):
+    """Monitor KL divergence and warn if too high."""
+
+    kl = (policy_logprobs - ref_logprobs).mean()
+
+    if kl > 0.1:
+        print(f"⚠️  Warning: KL divergence is {kl:.4f} (> 0.1)")
+        print("   Consider increasing kl_coef or decreasing learning_rate")
+
+    if kl > 0.3:
+        print(f"🚨 Critical: KL divergence is {kl:.4f} (> 0.3)")
+        print("   Policy may have diverged too far!")
+        print("   Recommendation: Stop training and restart from checkpoint")
+
+    return kl
+
+# In training loop
+kl_divergence = check_divergence(policy_logprobs, ref_logprobs)
+```
+
+## Updating the Reference Model
+
+### Should You Ever Update the Reference?
+
+**Generally: No!** The reference should remain frozen throughout RL training.
+
+**Exception: Iterative RLHF**
+
+In some advanced setups, RLHF is done iteratively:
+
+```
+Round 1: SFT → RLHF → Aligned Model v1
+Round 2: Aligned Model v1 → New Reference → More RLHF → Aligned Model v2
+Round 3: Aligned Model v2 → New Reference → More RLHF → Aligned Model v3
+...
+```
+
+**When to update reference:**
+1. Completed one round of RLHF
+2. Saved the aligned model
+3. Starting a new round with new objectives/reward model
+
+```python
+# After completing RLHF round 1
+aligned_model_v1 = policy_model
+aligned_model_v1.save_pretrained("aligned_v1")
+
+# Start round 2 with new reference
+reference_model = create_reference_model(aligned_model_v1)
+policy_model = copy.deepcopy(aligned_model_v1)  # Start from v1
+
+# Train with new reward model / objectives
+# ...
+```
+
+**Why this works:**
+- Each round starts from a better baseline
+- Reference anchors to current capabilities, not original SFT
+- Allows continuous improvement over multiple rounds
+
+### Risks of Updating Reference
+
+**Distribution shift accumulation:**
+- Round 1: Policy drifts from SFT
+- Round 2: Policy drifts from Round 1 result
+- Round 3: Policy drifts from Round 2 result
+- Eventually: Policy very different from original SFT
+
+**Reward model mismatch:**
+- Reward model trained on SFT outputs
+- After multiple rounds, policy generates text unlike SFT
+- Reward model may become unreliable
+
+**Solution: Retrain reward model** between rounds on data from latest policy.
+
+## Reference Model vs Initial Checkpoint
+
+### Common Confusion
+
+**Question:** "Can't I just load the SFT checkpoint each time instead of keeping a reference model in memory?"
+
+**Answer:** No! Here's why:
+
+```python
+# WRONG APPROACH:
+for step in training:
+    # Generate rollout
+    rollout = generate_rollout(policy_model)
+
+    # Load SFT checkpoint for reference
+    ref_model = load_checkpoint("sft_checkpoint")  # ← Expensive!
+    ref_logprobs = ref_model(rollout_data)
+
+    # Compute loss
+    loss = ppo_loss(..., ref_logprobs=ref_logprobs)
+```
+
+**Problems:**
+1. **Extremely slow:** Loading checkpoint from disk every step (seconds)
+2. **I/O bottleneck:** Disk reads are 1000x slower than GPU memory access
+3. **Unnecessary:** Reference never changes, so loading repeatedly is wasteful
+
+**Correct approach:**
+
+```python
+# CORRECT APPROACH:
+# Load once at start
+reference_model = create_reference_model(sft_model)
+
+# Keep in memory during training
+for step in training:
+    rollout = generate_rollout(policy_model)
+    ref_logprobs = reference_model(rollout_data)  # ← Fast!
+    loss = ppo_loss(..., ref_logprobs=ref_logprobs)
+```
+
+### Saving Reference Model
+
+You don't typically need to save reference model separately:
+
+```python
+# Save policy (the one that's training)
+policy_model.save_pretrained("checkpoint_step_100/policy")
+
+# Save SFT checkpoint initially (before RL)
+sft_model.save_pretrained("sft_checkpoint")
+
+# To resume training:
+# 1. Load policy from latest checkpoint
+policy_model = load_checkpoint("checkpoint_step_100/policy")
+
+# 2. Recreate reference from original SFT
+reference_model = load_checkpoint("sft_checkpoint")
+reference_model = freeze_model(reference_model)
+```
+
+**Exception:** If doing iterative RLHF, save reference from each round:
+
+```python
+# After round 1
+aligned_v1.save_pretrained("round1_final")
+
+# After round 2
+aligned_v2.save_pretrained("round2_final")
+
+# Each becomes the reference for next round
+```
+
+## Comparing Policy and Reference
+
+### Visualization: Distribution Divergence
+
+A useful diagnostic is comparing token probability distributions:
+
+```python
+def compare_distributions(policy_model, reference_model, prompt, tokenizer):
+    """Compare policy and reference distributions for a prompt."""
+
+    inputs = tokenizer(prompt, return_tensors="pt")
+
+    # Get distributions
+    with torch.no_grad():
+        policy_logits = policy_model(**inputs).logits[0, -1]  # Next token
+        ref_logits = reference_model(**inputs).logits[0, -1]
+
+        policy_probs = F.softmax(policy_logits, dim=-1)
+        ref_probs = F.softmax(ref_logits, dim=-1)
+
+    # Top-10 tokens for each
+    policy_top = torch.topk(policy_probs, 10)
+    ref_top = torch.topk(ref_probs, 10)
+
+    print("Policy top tokens:")
+    for prob, idx in zip(policy_top.values, policy_top.indices):
+        token = tokenizer.decode([idx])
+        print(f"  {token:20s} {prob:.4f}")
+
+    print("\nReference top tokens:")
+    for prob, idx in zip(ref_top.values, ref_top.indices):
+        token = tokenizer.decode([idx])
+        print(f"  {token:20s} {prob:.4f}")
+
+    # KL divergence
+    kl = (policy_probs * (policy_probs.log() - ref_probs.log())).sum()
+    print(f"\nKL divergence: {kl:.4f}")
+
+# Example usage
+compare_distributions(
+    policy_model,
+    reference_model,
+    prompt="The capital of France is",
+    tokenizer=tokenizer
+)
+```
+
+**Expected output after training:**
+
+```
+Policy top tokens:
+  Paris               0.7500  ← Policy learned this is correct!
+  Lyon                0.0800
+  France              0.0400
+  ...
+
+Reference top tokens:
+  Paris               0.3200  ← Reference less certain
+  Lyon                0.1500
+  France              0.1200
+  ...
+
+KL divergence: 0.042  ← Moderate divergence
+```
+
+### Generation Comparison
+
+Compare full generated responses:
+
+```python
+def compare_generations(policy_model, reference_model, prompt, tokenizer):
+    """Generate responses from both models and compare."""
+
+    inputs = tokenizer(prompt, return_tensors="pt")
+
+    print(f"Prompt: {prompt}\n")
+
+    # Generate with policy
+    with torch.no_grad():
+        policy_output = policy_model.generate(
+            **inputs,
+            max_new_tokens=50,
+            do_sample=True,
+            temperature=1.0
+        )
+    policy_text = tokenizer.decode(policy_output[0])
+    print(f"Policy: {policy_text}\n")
+
+    # Generate with reference
+    with torch.no_grad():
+        ref_output = reference_model.generate(
+            **inputs,
+            max_new_tokens=50,
+            do_sample=True,
+            temperature=1.0
+        )
+    ref_text = tokenizer.decode(ref_output[0])
+    print(f"Reference: {ref_text}\n")
+
+    # Score both with reward model
+    policy_reward = reward_model(policy_output).item()
+    ref_reward = reward_model(ref_output).item()
+
+    print(f"Policy reward: {policy_reward:.4f}")
+    print(f"Reference reward: {ref_reward:.4f}")
+    print(f"Improvement: {policy_reward - ref_reward:.4f}")
+
+# Example
+compare_generations(
+    policy_model,
+    reference_model,
+    prompt="Explain quantum computing:",
+    tokenizer=tokenizer
+)
+```
+
+## Advanced: Ensemble Reference Models
+
+For even more stability, use an ensemble of reference models:
+
+```python
+class EnsembleReferenceModel:
+    """Ensemble of multiple reference models for robust KL penalty."""
+
+    def __init__(self, reference_models: List[torch.nn.Module]):
+        self.reference_models = reference_models
+
+    def get_logprobs(self, input_ids, attention_mask):
+        """Average log probabilities from all reference models."""
+
+        all_logprobs = []
+
+        for ref_model in self.reference_models:
+            with torch.no_grad():
+                outputs = ref_model(input_ids, attention_mask)
+                logprobs = F.log_softmax(outputs.logits, dim=-1)
+                all_logprobs.append(logprobs)
+
+        # Average in log space
+        avg_logprobs = torch.stack(all_logprobs).mean(dim=0)
+
+        return avg_logprobs
+
+# Usage
+reference_models = [
+    create_reference_model(sft_model_1),
+    create_reference_model(sft_model_2),
+    create_reference_model(sft_model_3),
+]
+
+ensemble_ref = EnsembleReferenceModel(reference_models)
+
+# Compute KL against ensemble
+ref_logprobs = ensemble_ref.get_logprobs(input_ids, attention_mask)
+kl_penalty = (policy_logprobs - ref_logprobs).mean()
+```
+
+**Benefits:**
+- More robust KL penalty (averages out quirks of individual models)
+- Prevents policy from exploiting specific model's weaknesses
+- Smoother optimization landscape
+
+**Costs:**
+- 3x memory usage for reference models
+- 3x slower reference inference
+
+## Summary: Reference Model Best Practices
+
+### Do's ✅
+
+1. **Create reference once** at the start of RL training
+2. **Deep copy** the SFT model (not shallow copy)
+3. **Freeze all parameters** (`requires_grad = False`)
+4. **Set to eval mode** (`model.eval()`)
+5. **Verify independence** after creation
+6. **Monitor KL divergence** during training
+7. **Save SFT checkpoint** before RL (for reloading reference)
+
+### Don'ts ❌
+
+1. **Don't update reference** during training (unless iterative RLHF)
+2. **Don't share parameters** between policy and reference
+3. **Don't reload from disk** every step (keep in memory)
+4. **Don't ignore high KL** divergence (> 0.1)
+5. **Don't skip reference model** ("I'll just use KL = 0")
+6. **Don't use shallow copy** (will update with policy!)
+
+### Checklist for RLHF Setup
+
+```python
+# 1. Train SFT model
+sft_model = train_sft(...)
+sft_model.save_pretrained("sft_checkpoint")  # ← Save this!
+
+# 2. Create reference model
+reference_model = copy.deepcopy(sft_model)   # ← Deep copy
+reference_model.eval()                        # ← Eval mode
+for param in reference_model.parameters():
+    param.requires_grad = False               # ← Freeze
+
+# 3. Verify
+assert not any(p.requires_grad for p in reference_model.parameters())
+assert not reference_model.training
+
+# 4. Initialize policy from SFT
+policy_model = sft_model  # This one will be trained
+
+# 5. Train with RL
+for step in training:
+    # Use reference_model for KL penalty
+    # Never update reference_model
+    ...
+```
+
+## Further Reading
+
+**RL Theory:**
+- [Policy Gradient Methods for Reinforcement Learning](https://papers.nips.cc/paper/1713-policy-gradient-methods-for-reinforcement-learning-with-function-approximation.pdf)
+- [Trust Region Policy Optimization (TRPO)](https://arxiv.org/abs/1502.05477)
+
+**RLHF Practice:**
+- [Training language models to follow instructions (InstructGPT)](https://arxiv.org/abs/2203.02155)
+- [Fine-Tuning Language Models from Human Preferences](https://arxiv.org/abs/1909.08593)
+- [Scaling Laws for Reward Model Overoptimization](https://arxiv.org/abs/2210.10760)
+
+**Implementation Examples:**
+- [HuggingFace TRL Library](https://github.com/huggingface/trl)
+- [OpenAI Baselines](https://github.com/openai/baselines)
+
+## Congratulations! 🎉
+
+You've completed the deep dive into RLHF with PPO! You now understand:
+
+1. ✅ **The complete RLHF pipeline** - SFT → Reward Model → PPO
+2. ✅ **PPO algorithm** - Clipped objective, trust regions, stability
+3. ✅ **KL penalty** - Preventing reward hacking and distribution shift
+4. ✅ **Training dynamics** - Rollout generation, GAE, two-phase training
+5. ✅ **Reference models** - Creation, usage, memory management, divergence
+
+You're now equipped to implement and debug RLHF training for language models!
+
+### Next Steps
+
+- **Practice:** Try training on your own datasets
+- **Experiment:** Tune hyperparameters, try different configurations
+- **Explore alternatives:** Learn about DPO, RLAIF, Constitutional AI
+- **Dive deeper:** Read the InstructGPT and PPO papers
+
+Happy training! 🚀

@@ -1,0 +1,853 @@
+---
+title: DPO Loss Function - Deep Dive
+description: Understanding the DPO loss function, implicit reward modeling, beta parameter effects, label smoothing, and log probability computation
+---
+
+import { Card, CardGrid, Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+## The DPO Loss Function
+
+The DPO loss function is elegantly simple yet theoretically grounded. Let's build understanding from first principles to implementation.
+
+## Mathematical Formulation
+
+### Standard DPO Loss
+
+Given a preference example $(x, y_w, y_l)$ where:
+- $x$ is the prompt
+- $y_w$ is the chosen (preferred) response
+- $y_l$ is the rejected response
+
+The DPO loss is:
+
+$$
+\mathcal{L}_{\text{DPO}}(\pi_\theta; \pi_{\text{ref}}, \beta) = -\mathbb{E}_{(x,y_w,y_l)} \left[ \log \sigma \left( \beta \log \frac{\pi_\theta(y_w|x)}{\pi_{\text{ref}}(y_w|x)} - \beta \log \frac{\pi_\theta(y_l|x)}{\pi_{\text{ref}}(y_l|x)} \right) \right]
+$$
+
+where:
+- $\pi_\theta$ is the policy model being trained
+- $\pi_{\text{ref}}$ is the frozen reference model (initial SFT model)
+- $\beta$ is the temperature parameter controlling KL penalty
+- $\sigma(z) = \frac{1}{1 + e^{-z}}$ is the sigmoid function
+
+### Simplified Form
+
+Let's define **log-ratios**:
+
+$$
+\begin{align}
+r_w &= \log \frac{\pi_\theta(y_w|x)}{\pi_{\text{ref}}(y_w|x)} = \log \pi_\theta(y_w|x) - \log \pi_{\text{ref}}(y_w|x) \\
+r_l &= \log \frac{\pi_\theta(y_l|x)}{\pi_{\text{ref}}(y_l|x)} = \log \pi_\theta(y_l|x) - \log \pi_{\text{ref}}(y_l|x)
+\end{align}
+$$
+
+Then the loss becomes:
+
+$$
+\mathcal{L}_{\text{DPO}} = -\mathbb{E} \left[ \log \sigma(\beta (r_w - r_l)) \right]
+$$
+
+**Intuition:** We want the policy's log-ratio for the chosen response to be **larger** than for the rejected response. The sigmoid ensures this is a smooth, bounded objective.
+
+### Equivalent Forms
+
+The DPO loss can be written in several equivalent ways:
+
+**Form 1: Negative log-sigmoid**
+$$
+\mathcal{L}_{\text{DPO}} = -\log \sigma(\beta (r_w - r_l))
+$$
+
+**Form 2: Log-sum-exp (numerically stable)**
+$$
+\mathcal{L}_{\text{DPO}} = \log(1 + \exp(-\beta (r_w - r_l)))
+$$
+
+**Form 3: Softplus**
+$$
+\mathcal{L}_{\text{DPO}} = \text{softplus}(-\beta (r_w - r_l))
+$$
+
+where $\text{softplus}(x) = \log(1 + e^x)$ is a smooth approximation of $\max(0, x)$.
+
+<Aside type="tip">
+  **Implementation note:** Form 2 (log-sum-exp) is most numerically stable. PyTorch's `F.logsigmoid` implements this using the identity: $\log \sigma(x) = -\log(1 + e^{-x}) = -\text{softplus}(-x)$
+</Aside>
+
+## The Implicit Reward Model
+
+### Extracting the Reward
+
+Even though DPO doesn't train a reward model, we can extract an **implicit reward** from the trained policy:
+
+$$
+r_{\text{implicit}}(x, y) = \beta \log \frac{\pi_\theta(y|x)}{\pi_{\text{ref}}(y|x)}
+$$
+
+**This is the reward function that DPO implicitly optimizes!**
+
+### What Does This Reward Mean?
+
+**Interpretation:**
+- **Positive reward:** Policy assigns higher probability than reference → this response is better
+- **Zero reward:** Policy assigns same probability as reference → no preference learned
+- **Negative reward:** Policy assigns lower probability than reference → this response is worse
+
+**Magnitude:**
+- Large $|r|$: Strong preference signal
+- Small $|r|$: Weak preference signal
+- $r_w - r_l > 0$: Correctly prefers chosen over rejected
+
+### Monitoring During Training
+
+We track these implicit rewards to monitor learning:
+
+```python
+# During training
+chosen_rewards = beta * (policy_chosen_logps - ref_chosen_logps)
+rejected_rewards = beta * (policy_rejected_logps - ref_rejected_logps)
+
+# Metrics
+reward_margin = (chosen_rewards - rejected_rewards).mean()  # Should be positive and growing
+accuracy = (chosen_rewards > rejected_rewards).float().mean()  # Should increase toward 1.0
+```
+
+**Expected values:**
+- **Start of training:** margin ≈ 0 (policy = reference)
+- **After training:** margin = 1-5 (depending on β)
+- **Accuracy:** 50% → 65-80%
+
+## The Beta Parameter
+
+Beta ($\beta$) is **the most important hyperparameter** in DPO. It controls the strength of the KL penalty.
+
+### Mathematical Role
+
+Recall the RLHF objective that DPO implicitly optimizes:
+
+$$
+\max_{\pi_\theta} \mathbb{E} \left[ r(x, y) \right] - \beta \cdot D_{KL}(\pi_\theta \| \pi_{\text{ref}})
+$$
+
+Beta controls the tradeoff:
+- **High reward:** Move toward preferred responses
+- **Low KL:** Stay close to reference model
+
+### Effect of Beta Values
+
+<Tabs>
+  <TabItem label="Small β (e.g., 0.05)">
+
+**Behavior:**
+- **Weak KL penalty** → Policy can diverge significantly from reference
+- **Large gradients** → Faster learning of preferences
+- **High reward margins** → Strong differentiation between chosen/rejected
+
+**Pros:**
+- More aggressive alignment
+- Potentially better performance if data is clean
+- Faster convergence
+
+**Cons:**
+- Risk of overfitting to training preferences
+- Potential mode collapse (generating similar responses)
+- May produce incoherent text (too far from reference)
+- Sensitive to noisy preferences
+
+**Use when:**
+- High-quality, clean preference data
+- Want aggressive alignment
+- Have good validation set to catch overfitting
+
+</TabItem>
+
+  <TabItem label="Medium β (e.g., 0.1-0.2)">
+
+**Behavior:**
+- **Moderate KL penalty** → Balanced divergence from reference
+- **Stable gradients** → Steady learning
+- **Moderate reward margins** → Reasonable differentiation
+
+**Pros:**
+- Good balance of alignment and stability
+- Robust to moderately noisy data
+- Maintains text quality while improving preferences
+
+**Cons:**
+- May be too conservative for very clean data
+- May be too aggressive for very noisy data
+
+**Use when:**
+- Standard preference data quality
+- Default choice for most applications
+- First time training with DPO
+
+**Recommended:** β = 0.1 is the most commonly used value in practice.
+
+</TabItem>
+
+  <TabItem label="Large β (e.g., 0.5-1.0)">
+
+**Behavior:**
+- **Strong KL penalty** → Policy stays very close to reference
+- **Small gradients** → Slow, conservative learning
+- **Small reward margins** → Subtle differentiation
+
+**Pros:**
+- Very stable training
+- Robust to noisy preferences
+- Maintains reference model qualities
+- Low risk of mode collapse or incoherence
+
+**Cons:**
+- May underfit to preferences
+- Slower convergence
+- Limited alignment improvement
+- May not be worth the training time
+
+**Use when:**
+- Very noisy or conflicting preferences
+- Want to preserve reference model behavior
+- Safety-critical applications
+
+</TabItem>
+</Tabs>
+
+### Beta and KL Divergence Relationship
+
+The KL divergence grows as beta decreases:
+
+| Beta | Expected Final KL | Policy Divergence |
+|------|-------------------|-------------------|
+| 0.05 | 2-5 | Large |
+| 0.1 | 0.5-2 | Moderate |
+| 0.2 | 0.2-1 | Small |
+| 0.5 | 0.05-0.3 | Minimal |
+
+<Aside type="caution">
+  **Watch for:** KL > 10 indicates possible divergence. Lower learning rate or increase β.
+</Aside>
+
+### Choosing Beta in Practice
+
+**Step 1: Start with default**
+```python
+beta = 0.1  # Works well for most cases
+```
+
+**Step 2: Monitor training metrics**
+- **KL divergence:** Should grow but stay < 5
+- **Reward margin:** Should increase to 1-3
+- **Generation quality:** Check samples don't become incoherent
+
+**Step 3: Adjust if needed**
+```python
+if kl_divergence > 5 or generations_incoherent:
+    beta = 0.2  # More conservative
+
+elif accuracy_plateau < 0.65 or margin < 0.5:
+    beta = 0.05  # More aggressive
+```
+
+## Label Smoothing
+
+Standard DPO assumes preferences are **deterministic**: chosen is always better than rejected.
+
+**Reality:** Preferences are often:
+- Noisy (annotator disagreement)
+- Ambiguous (both responses are good/bad)
+- Incorrect (annotation errors)
+
+### Mathematical Formulation
+
+With label smoothing parameter $\epsilon \in [0, 1]$:
+
+$$
+P_{\text{smooth}}(y_w \succ y_l) = (1 - \epsilon) \cdot 1 + \epsilon \cdot \frac{1}{2} = 1 - \frac{\epsilon}{2}
+$$
+
+**Interpretation:**
+- $\epsilon = 0$: Chosen is always better (standard DPO)
+- $\epsilon = 0.3$: Chosen is better 85% of the time (smooth DPO)
+- $\epsilon = 1.0$: No preference (uniform)
+
+### Modified Loss Function
+
+The smooth DPO loss becomes:
+
+$$
+\mathcal{L}_{\text{smooth}} = -(1 - \epsilon) \log \sigma(\beta (r_w - r_l)) - \epsilon \log \sigma(-\beta (r_w - r_l))
+$$
+
+**Intuition:**
+- First term: Maximize probability chosen > rejected (weighted by 1-ε)
+- Second term: Maximize probability rejected > chosen (weighted by ε)
+
+This interpolates between:
+- Preferring chosen (weight 1-ε)
+- Being uncertain (weight ε)
+
+### Implementation
+
+From `src/auto_bot_tuner/dpo/loss.py`:
+
+```python
+def compute_dpo_loss(
+    policy_chosen_logps: torch.Tensor,
+    policy_rejected_logps: torch.Tensor,
+    reference_chosen_logps: torch.Tensor,
+    reference_rejected_logps: torch.Tensor,
+    beta: float = 0.1,
+    label_smoothing: float = 0.0,
+    reduction: str = "mean"
+) -> torch.Tensor:
+    # Compute log ratios
+    chosen_log_ratios = policy_chosen_logps - reference_chosen_logps
+    rejected_log_ratios = policy_rejected_logps - reference_rejected_logps
+
+    # Logits for Bradley-Terry model
+    logits = beta * (chosen_log_ratios - rejected_log_ratios)
+
+    if label_smoothing > 0.0:
+        # Smooth loss: interpolate between correct and incorrect labels
+        loss = (
+            -F.logsigmoid(logits) * (1 - label_smoothing) +
+            -F.logsigmoid(-logits) * label_smoothing
+        )
+    else:
+        # Standard DPO loss
+        loss = -F.logsigmoid(logits)
+
+    if reduction == "mean":
+        return loss.mean()
+    elif reduction == "sum":
+        return loss.sum()
+    else:
+        return loss
+```
+
+### When to Use Label Smoothing
+
+<CardGrid>
+  <Card title="ε = 0.0 (No Smoothing)">
+    **Use when:**
+    - High-quality, expert annotations
+    - Clear preference differences
+    - Want maximum alignment
+
+    **Example:** Professional editors ranking writing quality
+  </Card>
+
+  <Card title="ε = 0.1-0.2 (Light Smoothing)">
+    **Use when:**
+    - Standard crowdsourced annotations
+    - Some annotator disagreement expected
+    - Want robust training
+
+    **Example:** Multiple annotators with moderate agreement
+  </Card>
+
+  <Card title="ε = 0.3-0.5 (Heavy Smoothing)">
+    **Use when:**
+    - Noisy or conflicting annotations
+    - Ambiguous preference tasks
+    - Want very conservative training
+
+    **Example:** Subjective preferences (humor, creativity) with high disagreement
+  </Card>
+</CardGrid>
+
+<Aside type="note">
+  **In practice:** Most implementations use ε = 0.0 (no smoothing). Only use smoothing if you observe high training loss with low validation accuracy, indicating noisy labels.
+</Aside>
+
+## Log Probability Computation
+
+A critical component of DPO is computing log probabilities $\log \pi(y|x)$ for full sequences.
+
+### The Challenge
+
+Language models output logits for **each token position**, but we need the **total log probability** of the entire sequence.
+
+### Solution: Sum of Token Log Probabilities
+
+For a sequence $y = (y_1, y_2, \ldots, y_T)$ given prompt $x$:
+
+$$
+\log \pi(y|x) = \sum_{t=1}^{T} \log \pi(y_t | x, y_{<t})
+$$
+
+**Why sum in log space?** Because:
+- $P(y|x) = \prod_{t=1}^{T} P(y_t | x, y_{<t})$ (product of probabilities)
+- $\log P(y|x) = \sum_{t=1}^{T} \log P(y_t | x, y_{<t})$ (sum of log probabilities)
+
+### Implementation Details
+
+From `src/auto_bot_tuner/dpo/loss.py`:
+
+```python
+def get_batch_logps(
+    logits: torch.Tensor,  # (batch_size, seq_len, vocab_size)
+    labels: torch.Tensor,  # (batch_size, seq_len)
+    attention_mask: Optional[torch.Tensor] = None,
+    return_per_token: bool = False
+) -> torch.Tensor:
+    """
+    Compute log probabilities for a batch of sequences.
+
+    Returns:
+        Log probabilities of shape (batch_size,)
+    """
+    # Shift logits and labels for next-token prediction
+    # Model predicts token i+1 from tokens 0...i
+    shift_logits = logits[:, :-1, :].contiguous()
+    shift_labels = labels[:, 1:].contiguous()
+
+    # Compute log probabilities
+    log_probs = F.log_softmax(shift_logits, dim=-1)
+
+    # Gather log probs of the actual tokens
+    # Shape: (batch_size, seq_len-1)
+    token_log_probs = torch.gather(
+        log_probs,
+        dim=2,
+        index=shift_labels.unsqueeze(2)
+    ).squeeze(2)
+
+    # Apply attention mask if provided (ignore padding)
+    if attention_mask is not None:
+        shift_mask = attention_mask[:, 1:].contiguous()
+        token_log_probs = token_log_probs * shift_mask
+
+        # Sum over real tokens only
+        return token_log_probs.sum(dim=1)
+    else:
+        # Sum over all tokens
+        return token_log_probs.sum(dim=1)
+```
+
+### Why Shift Logits and Labels?
+
+Language models are trained for **next-token prediction**:
+- Input: tokens 0 to t
+- Output: logits for token t+1
+
+**Example:**
+```
+Tokens:   [BOS, "The", "cat", "sat", EOS]
+Indices:  [  0,   1,     2,     3,    4 ]
+
+Logits[0] predicts "The" (index 1)
+Logits[1] predicts "cat" (index 2)
+Logits[2] predicts "sat" (index 3)
+Logits[3] predicts EOS  (index 4)
+```
+
+So we compute loss on:
+- `shift_logits = logits[:, :-1]` (predictions for positions 0-3)
+- `shift_labels = labels[:, 1:]` (actual tokens at positions 1-4)
+
+### Handling Padding
+
+Sequences in a batch have different lengths, so we pad shorter sequences. We must **exclude padding tokens** from log probability computation:
+
+```python
+# Without masking (WRONG)
+log_prob = token_log_probs.sum()  # Includes padding!
+
+# With masking (CORRECT)
+if attention_mask is not None:
+    shift_mask = attention_mask[:, 1:]  # Align with shifted labels
+    token_log_probs = token_log_probs * shift_mask  # Zero out padding
+    log_prob = token_log_probs.sum()  # Only real tokens
+```
+
+### Per-Token vs Total Log Probability
+
+**Total (default):**
+```python
+log_prob = token_log_probs.sum(dim=1)  # Sum over sequence
+# Shape: (batch_size,)
+# Longer sequences have more negative values
+```
+
+**Per-token (normalized):**
+```python
+log_prob = token_log_probs.sum(dim=1) / mask.sum(dim=1)  # Average
+# Shape: (batch_size,)
+# Length-normalized, more comparable across sequences
+```
+
+<Aside type="note">
+  **DPO uses total log probability** (not per-token). This is correct because the Bradley-Terry model should account for sequence length—longer sequences accumulate more log probability.
+</Aside>
+
+## Complete Loss Computation Flow
+
+Let's trace through the complete DPO loss computation:
+
+### Step 1: Forward Pass
+
+```python
+# Policy model forward pass on chosen responses
+policy_chosen_outputs = policy_model(
+    input_ids=chosen_input_ids,  # (batch_size, chosen_len)
+    attention_mask=chosen_attention_mask
+)
+policy_chosen_logits = policy_chosen_outputs.logits  # (batch_size, chosen_len, vocab)
+
+# Policy model forward pass on rejected responses
+policy_rejected_outputs = policy_model(
+    input_ids=rejected_input_ids,  # (batch_size, rejected_len)
+    attention_mask=rejected_attention_mask
+)
+policy_rejected_logits = policy_rejected_outputs.logits  # (batch_size, rejected_len, vocab)
+
+# Reference model forward pass (no gradients)
+with torch.no_grad():
+    ref_chosen_outputs = reference_model(
+        input_ids=chosen_input_ids,
+        attention_mask=chosen_attention_mask
+    )
+    ref_chosen_logits = ref_chosen_outputs.logits
+
+    ref_rejected_outputs = reference_model(
+        input_ids=rejected_input_ids,
+        attention_mask=rejected_attention_mask
+    )
+    ref_rejected_logits = ref_rejected_outputs.logits
+```
+
+### Step 2: Compute Log Probabilities
+
+```python
+# Convert logits to sequence log probabilities
+policy_chosen_logps = get_batch_logps(
+    policy_chosen_logits,
+    chosen_input_ids,  # Labels are same as input
+    chosen_attention_mask
+)  # Shape: (batch_size,)
+
+policy_rejected_logps = get_batch_logps(
+    policy_rejected_logits,
+    rejected_input_ids,
+    rejected_attention_mask
+)  # Shape: (batch_size,)
+
+ref_chosen_logps = get_batch_logps(
+    ref_chosen_logits,
+    chosen_input_ids,
+    chosen_attention_mask
+)  # Shape: (batch_size,)
+
+ref_rejected_logps = get_batch_logps(
+    ref_rejected_logits,
+    rejected_input_ids,
+    rejected_attention_mask
+)  # Shape: (batch_size,)
+```
+
+### Step 3: Compute Log Ratios
+
+```python
+# Log ratios: log(π_θ / π_ref)
+chosen_log_ratios = policy_chosen_logps - ref_chosen_logps  # (batch_size,)
+rejected_log_ratios = policy_rejected_logps - ref_rejected_logps  # (batch_size,)
+```
+
+### Step 4: Compute Logits for Bradley-Terry Model
+
+```python
+# Difference of log ratios, scaled by beta
+logits = beta * (chosen_log_ratios - rejected_log_ratios)  # (batch_size,)
+```
+
+**Interpretation:**
+- `logits > 0`: Policy prefers chosen over rejected (good!)
+- `logits < 0`: Policy prefers rejected over chosen (bad!)
+- `logits >> 0`: Strong preference for chosen (very good!)
+
+### Step 5: Compute Loss
+
+```python
+# DPO loss: -log sigmoid(logits)
+loss = -F.logsigmoid(logits)  # (batch_size,)
+
+# Average over batch
+loss = loss.mean()  # Scalar
+```
+
+### Step 6: Compute Metrics
+
+```python
+with torch.no_grad():
+    # Implicit rewards
+    chosen_rewards = beta * chosen_log_ratios
+    rejected_rewards = beta * rejected_log_ratios
+
+    # Accuracy: fraction where chosen > rejected
+    accuracy = (chosen_rewards > rejected_rewards).float().mean()
+
+    # Reward margin
+    reward_margin = (chosen_rewards - rejected_rewards).mean()
+
+    # KL divergence approximation
+    kl_div = (chosen_log_ratios.mean() + rejected_log_ratios.mean()) / 2
+```
+
+### Step 7: Backpropagation
+
+```python
+# Backward pass (only policy model has gradients)
+loss.backward()
+
+# Update policy model
+optimizer.step()
+optimizer.zero_grad()
+```
+
+## Numerical Stability Considerations
+
+### Issue 1: Log-Sum-Exp Instability
+
+**Problem:** Computing $\log(1 + e^{-x})$ can overflow for large negative $x$.
+
+**Solution:** PyTorch's `F.logsigmoid` uses a numerically stable implementation:
+
+```python
+def logsigmoid_stable(x):
+    # Standard: log(sigmoid(x)) = log(1/(1+exp(-x))) = -log(1+exp(-x))
+    # Problem: exp(-x) overflows for x ≪ 0
+
+    # Stable version:
+    return -F.softplus(-x)
+    # where softplus(x) = log(1 + exp(x))
+    # uses: log(1 + exp(x)) = max(0, x) + log(1 + exp(-abs(x)))
+```
+
+**Always use:** `F.logsigmoid(logits)` instead of `torch.log(torch.sigmoid(logits))`
+
+### Issue 2: Sequence Log Probability Underflow
+
+**Problem:** Long sequences have very negative log probabilities (product of many probabilities < 1).
+
+**Example:**
+```
+log P(token 1) = -2.3
+log P(token 2) = -1.8
+...
+log P(token 512) = -2.1
+
+Total log P = sum = -1024.7  (very negative!)
+```
+
+**This is okay!** Log space handles it gracefully. Problems only arise if you exponentiate (don't do this):
+
+```python
+# BAD: Don't do this
+prob = torch.exp(log_prob)  # Underflows to 0
+
+# GOOD: Stay in log space
+log_ratio = log_prob_policy - log_prob_ref  # Differences are reasonable
+```
+
+### Issue 3: Gradient Vanishing
+
+**Problem:** If `logits = beta * (r_w - r_l)` is very large (positive or negative), sigmoid saturates:
+
+```
+sigmoid(100) ≈ 1.0 → gradient ≈ 0
+sigmoid(-100) ≈ 0.0 → gradient ≈ 0
+```
+
+**Solution:** Clip log ratios (optional):
+
+```python
+# Clip log ratios to prevent saturation
+chosen_log_ratios = torch.clamp(chosen_log_ratios, -10, 10)
+rejected_log_ratios = torch.clamp(rejected_log_ratios, -10, 10)
+
+logits = beta * (chosen_log_ratios - rejected_log_ratios)
+# Now logits in reasonable range: [-2, 2] for beta=0.1
+```
+
+<Aside type="caution">
+  **Usually not needed:** Clipping is rarely necessary in practice. Only use if you observe gradient vanishing (loss plateaus but accuracy is low).
+</Aside>
+
+## Loss Function Variants
+
+### DPO (Standard)
+
+$$
+\mathcal{L}_{\text{DPO}} = -\log \sigma(\beta (r_w - r_l))
+$$
+
+**Characteristics:**
+- Maximizes likelihood of preferences
+- Penalizes according to Bradley-Terry model
+- Most widely used
+
+### IPO (Identity Preference Optimization)
+
+$$
+\mathcal{L}_{\text{IPO}} = (r_w - r_l - \tau)^2
+$$
+
+**Characteristics:**
+- MSE loss with target margin τ
+- Simpler than DPO (no sigmoid)
+- Can work without reference model in some cases
+
+### CPO (Contrastive Preference Optimization)
+
+$$
+\mathcal{L}_{\text{CPO}} = \max(0, \tau - \beta (r_w - r_l))
+$$
+
+**Characteristics:**
+- Hinge loss with margin
+- Only penalizes if margin < τ
+- Sparse gradients (like SVM)
+
+### SLiC (Sequence Likelihood Calibration)
+
+$$
+\mathcal{L}_{\text{SLiC}} = -\log \pi_\theta(y_w|x) + \log \pi_\theta(y_l|x)
+$$
+
+**Characteristics:**
+- Directly maximize chosen, minimize rejected
+- No reference model needed
+- Simpler but less theoretically grounded
+
+<Aside type="note">
+  **Recommendation:** Stick with standard DPO unless you have specific reasons to use variants. DPO has the best theoretical foundation and empirical results.
+</Aside>
+
+## Debugging Loss Function Issues
+
+### Issue 1: Loss Not Decreasing
+
+**Symptoms:**
+- Loss stays around 0.69 (random: -log(0.5))
+- Accuracy stays around 50%
+- Reward margin stays near 0
+
+**Possible causes:**
+1. **Learning rate too low** → Increase to 5e-7 or 1e-6
+2. **Beta too high** → Decrease to 0.05 or 0.1
+3. **Reference model doesn't match policy** → Ensure they're identical initially
+4. **Gradient issues** → Check gradients are flowing: `assert policy_model.requires_grad_()`
+
+### Issue 2: Loss Increasing or Unstable
+
+**Symptoms:**
+- Loss oscillates wildly
+- NaN or Inf values appear
+- KL divergence exploding
+
+**Possible causes:**
+1. **Learning rate too high** → Decrease to 1e-7 or 5e-8
+2. **Beta too low** → Increase to 0.2 or 0.5
+3. **Numerical instability** → Use `F.logsigmoid`, check for NaNs in data
+4. **Gradient explosion** → Add gradient clipping: `torch.nn.utils.clip_grad_norm_(params, 1.0)`
+
+### Issue 3: Loss Decreases But Accuracy Low
+
+**Symptoms:**
+- Loss drops significantly (0.69 → 0.3)
+- Accuracy stays low (50-55%)
+- Reward margin small (&lt;0.5)
+
+**Possible causes:**
+1. **Noisy preferences** → Add label smoothing (ε=0.1-0.3)
+2. **Conflicting preferences** → Clean data, check for contradictions
+3. **Beta too high** → Policy can't learn strong preferences
+4. **Insufficient training** → Train longer or on more data
+
+### Issue 4: Perfect Training But Poor Validation
+
+**Symptoms:**
+- Training accuracy 95%+
+- Validation accuracy 60%
+- Large train/val loss gap
+
+**Possible causes:**
+1. **Overfitting** → Stop early, use larger beta, add regularization
+2. **Distribution mismatch** → Ensure train/val come from same distribution
+3. **Small dataset** → Collect more data, use data augmentation
+4. **Beta too small** → Increase to 0.2-0.5 for more regularization
+
+## Code Example: Complete Loss Computation
+
+Here's a complete example from `src/auto_bot_tuner/dpo/loss.py`:
+
+```python
+def compute_dpo_loss_with_metrics(
+    policy_chosen_logps: torch.Tensor,
+    policy_rejected_logps: torch.Tensor,
+    reference_chosen_logps: torch.Tensor,
+    reference_rejected_logps: torch.Tensor,
+    beta: float = 0.1,
+    label_smoothing: float = 0.0
+) -> dict:
+    """
+    Compute DPO loss along with additional metrics for monitoring.
+
+    Returns:
+        Dictionary containing:
+        - loss: The DPO loss
+        - accuracy: Fraction where policy prefers chosen over rejected
+        - chosen_rewards: Implicit rewards for chosen responses
+        - rejected_rewards: Implicit rewards for rejected responses
+        - reward_margin: Average difference between chosen and rejected rewards
+        - kl_divergence: Approximate KL divergence from reference model
+    """
+    # Compute loss
+    loss = compute_dpo_loss(
+        policy_chosen_logps,
+        policy_rejected_logps,
+        reference_chosen_logps,
+        reference_rejected_logps,
+        beta,
+        label_smoothing,
+        reduction="mean"
+    )
+
+    # Compute implicit rewards: r(x,y) = beta * log(π_θ(y|x) / π_ref(y|x))
+    chosen_rewards = beta * (policy_chosen_logps - reference_chosen_logps)
+    rejected_rewards = beta * (policy_rejected_logps - reference_rejected_logps)
+
+    # Reward margin: how much better chosen is than rejected
+    reward_margin = (chosen_rewards - rejected_rewards).mean()
+
+    # Accuracy: fraction where policy correctly prefers chosen over rejected
+    accuracy = (chosen_rewards > rejected_rewards).float().mean()
+
+    # Approximate KL divergence from reference model
+    # KL(π_θ || π_ref) ≈ log(π_θ) - log(π_ref)
+    kl_divergence = (
+        (policy_chosen_logps - reference_chosen_logps).mean() +
+        (policy_rejected_logps - reference_rejected_logps).mean()
+    ) / 2
+
+    return {
+        "loss": loss,
+        "accuracy": accuracy,
+        "chosen_rewards": chosen_rewards.mean(),
+        "rejected_rewards": rejected_rewards.mean(),
+        "reward_margin": reward_margin,
+        "kl_divergence": kl_divergence,
+    }
+```
+
+## Next Steps
+
+Now that you understand the DPO loss function in detail:
+
+1. **[DPO Training](/dpo/training/)** - Complete training procedure and best practices
+2. **[DPO vs RLHF](/dpo/vs-rlhf/)** - When to use each method
+3. **[Preference Data](/reward/preference-data/)** - How to collect and format preference data
+
+Let's move on to the complete training procedure! 🚀

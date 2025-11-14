@@ -1,0 +1,778 @@
+---
+title: Proximal Policy Optimization (PPO)
+description: Deep dive into the PPO algorithm - the foundation of stable RLHF training
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+## What is PPO?
+
+**Proximal Policy Optimization (PPO)** is a policy gradient reinforcement learning algorithm that has become the gold standard for RLHF. Introduced by OpenAI in 2017, PPO solves the fundamental challenge of RL: **how to improve a policy without breaking it**.
+
+<Aside type="note">
+  PPO is what powers ChatGPT, Claude, and most modern aligned language models. Its stability and sample efficiency make it ideal for the high-dimensional action spaces of language modeling.
+</Aside>
+
+## The Core Problem: Policy Gradient Instability
+
+### Vanilla Policy Gradient
+
+The simplest RL algorithm optimizes the expected return directly:
+
+$$
+J(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} [R(\tau)]
+$$
+
+The gradient is:
+
+$$
+\nabla_\theta J(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \sum_{t} \nabla_\theta \log \pi_\theta(a_t | s_t) \cdot R(\tau) \right]
+$$
+
+**The algorithm:**
+1. Collect trajectories using current policy $\pi_\theta$
+2. Compute gradient: increase probability of actions that led to high rewards
+3. Update: $\theta \leftarrow \theta + \alpha \nabla_\theta J(\theta)$
+4. Repeat
+
+**The problem:** This is **extremely unstable**!
+
+### Why Policy Gradient Fails
+
+Consider this scenario:
+
+```python
+# Step 100: Policy is working well
+policy.generate("Explain quantum") → "Quantum mechanics describes..." (reward = 8.5)
+
+# Step 101: Gradient update too large
+# Policy changes drastically
+policy.generate("Explain quantum") → "asjkdfh qwerty..." (reward = 0.1)
+
+# Now we're collecting terrible data!
+# Policy will get worse and worse...
+```
+
+**The fundamental issue:** Neural networks are sensitive to parameter changes. A "reasonable" gradient step in parameter space can cause **catastrophic** changes in policy behavior.
+
+### The Trust Region Insight
+
+The key insight: We should only update the policy if we **trust** that the update will improve performance.
+
+**Trust region methods** add a constraint:
+
+$$
+\max_\theta \mathbb{E}_{\tau \sim \pi_{\theta_{\text{old}}}} [R(\tau)] \quad \text{subject to} \quad D_{\text{KL}}(\pi_{\theta_{\text{old}}} \| \pi_\theta) \leq \delta
+$$
+
+**Intuition:** "Improve the policy, but don't change it too much."
+
+This is the foundation of **TRPO** (Trust Region Policy Optimization), PPO's predecessor.
+
+## PPO: Trust Regions Made Simple
+
+TRPO works but is **computationally expensive** (requires computing Hessian-vector products). PPO achieves similar stability with a simple trick: **clipping**.
+
+### The PPO Objective
+
+PPO optimizes a **clipped surrogate objective**:
+
+$$
+L^{\text{CLIP}}(\theta) = \mathbb{E}_t \left[ \min \left( r_t(\theta) \hat{A}_t, \text{clip}(r_t(\theta), 1-\epsilon, 1+\epsilon) \hat{A}_t \right) \right]
+$$
+
+where:
+- $r_t(\theta) = \frac{\pi_\theta(a_t | s_t)}{\pi_{\theta_{\text{old}}}(a_t | s_t)}$ is the **probability ratio**
+- $\hat{A}_t$ is the **advantage estimate** (how much better is this action?)
+- $\epsilon$ is the **clipping threshold** (typically 0.2)
+
+Let's break this down step by step.
+
+### Understanding the Probability Ratio
+
+The ratio $r_t(\theta)$ measures how much the policy has changed:
+
+$$
+r_t(\theta) = \frac{\pi_\theta(a_t | s_t)}{\pi_{\theta_{\text{old}}}(a_t | s_t)}
+$$
+
+**Interpretation:**
+- $r_t = 1.0$: Policy hasn't changed for this action
+- $r_t = 1.5$: New policy is 1.5x more likely to take this action
+- $r_t = 0.5$: New policy is 0.5x as likely to take this action
+
+**Why ratio instead of log probability?**
+
+In importance sampling, we want to reuse old trajectories with a new policy:
+
+$$
+\mathbb{E}_{\tau \sim \pi_{\text{new}}} [f(\tau)] = \mathbb{E}_{\tau \sim \pi_{\text{old}}} \left[ \frac{\pi_{\text{new}}(\tau)}{\pi_{\text{old}}(\tau)} f(\tau) \right]
+$$
+
+The ratio corrects for the distribution mismatch!
+
+### The Unclipped Objective
+
+Without clipping, the objective is:
+
+$$
+L^{\text{UNCLIPPED}}(\theta) = \mathbb{E}_t \left[ r_t(\theta) \hat{A}_t \right]
+$$
+
+**When advantage is positive** ($\hat{A}_t > 0$):
+- Action was better than average
+- Want to **increase** its probability
+- Objective increases with $r_t$ → gradient pushes $r_t$ up
+
+**When advantage is negative** ($\hat{A}_t < 0$):
+- Action was worse than average
+- Want to **decrease** its probability
+- Objective increases as $r_t$ decreases → gradient pushes $r_t$ down
+
+**Problem:** No limit! Ratio can go to infinity or zero, causing instability.
+
+### The Clipped Objective
+
+PPO adds clipping:
+
+$$
+L^{\text{CLIP}}(\theta) = \mathbb{E}_t \left[ \min \left( r_t(\theta) \hat{A}_t, \text{clip}(r_t(\theta), 1-\epsilon, 1+\epsilon) \hat{A}_t \right) \right]
+$$
+
+The `clip` function restricts the ratio:
+
+$$
+\text{clip}(r_t, 1-\epsilon, 1+\epsilon) = \begin{cases}
+1 - \epsilon & \text{if } r_t < 1 - \epsilon \\
+r_t & \text{if } 1 - \epsilon \leq r_t \leq 1 + \epsilon \\
+1 + \epsilon & \text{if } r_t > 1 + \epsilon
+\end{cases}
+$$
+
+With $\epsilon = 0.2$, this means: "Only allow ratio to be between 0.8 and 1.2."
+
+The `min` takes the lower of:
+1. Unclipped objective: $r_t \hat{A}_t$
+2. Clipped objective: $\text{clip}(r_t, 1-\epsilon, 1+\epsilon) \hat{A}_t$
+
+**Result:** Conservative updates that prevent catastrophic changes.
+
+### Visualizing the Clipped Objective
+
+Let's visualize $L^{\text{CLIP}}$ for $\hat{A}_t > 0$ (positive advantage):
+
+```
+Objective
+
+  │           /
+  │          /  ← Unclipped (keeps growing)
+  │         /
+  │    ____/  ← Clipped (flat after 1+ε)
+  │   /
+  │  /
+  │ /
+  └───────────────────── Ratio r_t
+    0.8   1.0   1.2
+    ↑           ↑
+  1-ε         1+ε
+```
+
+**Key insight:** Once ratio exceeds $1+\epsilon$, increasing it further doesn't improve the objective. **Gradient becomes zero!** This prevents overshooting.
+
+For $\hat{A}_t < 0$ (negative advantage), the clip works in reverse, preventing ratio from dropping below $1-\epsilon$.
+
+## PPO Implementation
+
+Let's walk through the implementation from [`src/auto_bot_tuner/rlhf/ppo_loss.py`](https://github.com/yourusername/autotune/blob/main/src/auto_bot_tuner/rlhf/ppo_loss.py):
+
+### Computing the Probability Ratio
+
+```python
+def compute_ppo_loss(
+    logprobs: torch.Tensor,          # Log probs under current policy
+    old_logprobs: torch.Tensor,      # Log probs under old policy
+    advantages: torch.Tensor,        # Advantage estimates
+    mask: Optional[torch.Tensor] = None,
+    clip_ratio: float = 0.2
+) -> tuple[torch.Tensor, Dict[str, float]]:
+    """
+    Compute PPO clipped surrogate loss.
+    """
+    # Compute probability ratio: r = π_new / π_old
+    # In log space: log(r) = log π_new - log π_old
+    log_ratio = logprobs - old_logprobs
+    ratio = torch.exp(log_ratio)
+```
+
+**Why log space?**
+- Numerical stability (probabilities can be very small: $10^{-20}$)
+- Addition is faster than multiplication: $\log(a/b) = \log a - \log b$
+
+### The Clipped Objective
+
+```python
+    # PPO clipped objective
+    # Unclipped: ratio * advantage
+    unclipped_objective = ratio * advantages
+
+    # Clipped: clip(ratio, 1-ε, 1+ε) * advantage
+    clipped_ratio = torch.clamp(ratio, 1 - clip_ratio, 1 + clip_ratio)
+    clipped_objective = clipped_ratio * advantages
+
+    # Take minimum (conservative update)
+    per_token_loss = -torch.min(unclipped_objective, clipped_objective)
+```
+
+**Note the negative sign:** We want to **maximize** the objective, but optimizers **minimize** loss, so we negate it.
+
+### Applying Attention Mask
+
+```python
+    # Apply mask if provided
+    if mask is not None:
+        per_token_loss = per_token_loss * mask
+        num_tokens = mask.sum()
+    else:
+        num_tokens = per_token_loss.numel()
+
+    # Average over all tokens
+    loss = per_token_loss.sum() / (num_tokens + 1e-8)
+```
+
+**Why mask?** In language modeling, sequences have different lengths. We only compute loss on actual tokens (not padding).
+
+### Computing Metrics
+
+```python
+    with torch.no_grad():
+        # Fraction of times clipping was active
+        clipped = ((ratio < 1 - clip_ratio) | (ratio > 1 + clip_ratio)).float()
+        clip_fraction = clipped.sum() / num_tokens
+
+        # Average ratio
+        avg_ratio = ratio.mean()
+
+        # Approximate KL divergence
+        approx_kl = ((ratio - 1) - log_ratio).mean()
+
+        metrics = {
+            "ppo_loss": loss.item(),
+            "clip_fraction": clip_fraction.item(),
+            "avg_ratio": avg_ratio.item(),
+            "approx_kl": approx_kl.item(),
+        }
+```
+
+**Important metrics:**
+- **clip_fraction**: What % of updates are being clipped? (Target: 10-30%)
+- **avg_ratio**: How much is policy changing? (Should stay near 1.0)
+- **approx_kl**: KL divergence estimate (monitors policy change)
+
+## Value Function Loss
+
+PPO trains the value network alongside the policy:
+
+$$
+L^{V}(\theta) = \mathbb{E}_t \left[ (V_\theta(s_t) - \hat{R}_t)^2 \right]
+$$
+
+where $\hat{R}_t$ is the actual return (sum of future rewards).
+
+### With Clipping (PPO-Clip)
+
+PPO optionally clips value function updates too:
+
+$$
+L^{V}(\theta) = \mathbb{E}_t \left[ \max \left( (V_\theta(s_t) - \hat{R}_t)^2, (V_{\text{clip}} - \hat{R}_t)^2 \right) \right]
+$$
+
+where $V_{\text{clip}} = V_{\text{old}} + \text{clip}(V_\theta - V_{\text{old}}, -\epsilon, \epsilon)$
+
+From the implementation:
+
+```python
+def compute_value_loss(
+    values: torch.Tensor,            # Current value predictions
+    returns: torch.Tensor,           # Target returns
+    old_values: Optional[torch.Tensor] = None,
+    mask: Optional[torch.Tensor] = None,
+    clip_value: bool = True,
+    clip_ratio: float = 0.2
+) -> tuple[torch.Tensor, Dict[str, float]]:
+    """
+    Compute value function loss.
+    """
+    if clip_value and old_values is not None:
+        # Clipped value loss
+        value_pred_clipped = old_values + torch.clamp(
+            values - old_values,
+            -clip_ratio,
+            clip_ratio
+        )
+
+        # Unclipped and clipped losses
+        value_loss_unclipped = (values - returns) ** 2
+        value_loss_clipped = (value_pred_clipped - returns) ** 2
+
+        # Take maximum (conservative update)
+        per_token_loss = torch.max(value_loss_unclipped, value_loss_clipped)
+    else:
+        # Standard MSE loss
+        per_token_loss = (values - returns) ** 2
+```
+
+**Why clip value loss?** Same reason as policy: prevent catastrophic value function changes.
+
+## Entropy Bonus
+
+To encourage exploration, PPO adds an entropy bonus:
+
+$$
+H(\pi_\theta) = -\mathbb{E}_{a \sim \pi_\theta} [\log \pi_\theta(a | s)]
+$$
+
+High entropy = more randomness = more exploration
+
+From the implementation:
+
+```python
+def compute_entropy_bonus(
+    logits: torch.Tensor,
+    mask: Optional[torch.Tensor] = None
+) -> tuple[torch.Tensor, Dict[str, float]]:
+    """
+    Compute entropy bonus for exploration.
+    """
+    # Compute probabilities
+    probs = F.softmax(logits, dim=-1)
+    log_probs = F.log_softmax(logits, dim=-1)
+
+    # Entropy: -Σ p(a) log p(a)
+    entropy = -(probs * log_probs).sum(dim=-1)
+
+    # Average over all tokens
+    mean_entropy = entropy.sum() / num_tokens
+    return mean_entropy, {"entropy": mean_entropy.item()}
+```
+
+**Intuition:** If the model is too deterministic (always picks top token), entropy approaches 0. We want some randomness!
+
+## The Complete PPO Loss
+
+The total loss combines all components:
+
+$$
+L_{\text{TOTAL}} = L^{\text{CLIP}} + c_1 L^{V} - c_2 H + c_3 L^{\text{KL}}
+$$
+
+From the implementation:
+
+```python
+def compute_ppo_total_loss(
+    policy_logprobs: torch.Tensor,
+    old_logprobs: torch.Tensor,
+    ref_logprobs: torch.Tensor,
+    values: torch.Tensor,
+    old_values: torch.Tensor,
+    advantages: torch.Tensor,
+    returns: torch.Tensor,
+    logits: Optional[torch.Tensor] = None,
+    mask: Optional[torch.Tensor] = None,
+    clip_ratio: float = 0.2,
+    vf_coef: float = 0.5,          # Value function coefficient
+    entropy_coef: float = 0.01,     # Entropy coefficient
+    kl_coef: float = 0.1,           # KL penalty coefficient
+) -> tuple[torch.Tensor, Dict[str, Any]]:
+    """
+    Compute total PPO loss combining all components.
+    """
+    # Policy loss (PPO clipped objective)
+    policy_loss, policy_metrics = compute_ppo_loss(
+        logprobs=policy_logprobs,
+        old_logprobs=old_logprobs,
+        advantages=advantages,
+        mask=mask,
+        clip_ratio=clip_ratio
+    )
+
+    # Value loss
+    value_loss, value_metrics = compute_value_loss(
+        values=values,
+        returns=returns,
+        old_values=old_values,
+        mask=mask,
+        clip_value=True,
+        clip_ratio=clip_ratio
+    )
+
+    # Entropy bonus
+    entropy, entropy_metrics = compute_entropy_bonus(
+        logits=logits,
+        mask=mask
+    )
+
+    # KL penalty (stay close to reference)
+    kl_penalty, kl_metrics = compute_kl_penalty(
+        logprobs=policy_logprobs,
+        ref_logprobs=ref_logprobs,
+        mask=mask
+    )
+
+    # Combine losses
+    total_loss = (
+        policy_loss +
+        vf_coef * value_loss -
+        entropy_coef * entropy +
+        kl_coef * kl_penalty
+    )
+
+    # Aggregate metrics
+    metrics = {**policy_metrics, **value_metrics, **entropy_metrics, **kl_metrics}
+    metrics["total_loss"] = total_loss.item()
+
+    return total_loss, metrics
+```
+
+## PPO Hyperparameters
+
+Choosing the right hyperparameters is crucial for stability:
+
+### Clipping Parameter (ε)
+
+**Default:** 0.2
+
+**Effect:**
+- **Too small (0.1):** Very conservative updates, slow learning
+- **Too large (0.5):** Allows big policy changes, unstable
+
+**Tuning:** Monitor `clip_fraction`:
+- If < 10%: ε might be too large (rarely activating)
+- If > 50%: ε might be too small (clipping too much)
+
+### Value Function Coefficient (c₁)
+
+**Default:** 0.5
+
+**Effect:**
+- **Too small:** Value function learns slowly, poor advantage estimates
+- **Too large:** Value function dominates, policy learning suffers
+
+**Typical range:** 0.25 - 1.0
+
+### Entropy Coefficient (c₂)
+
+**Default:** 0.01
+
+**Effect:**
+- **Too small:** Policy becomes deterministic, poor exploration
+- **Too large:** Policy stays too random, doesn't converge
+
+**Annealing:** Often decreased over training:
+```python
+entropy_coef = 0.01 * (1 - step / total_steps)  # Linear decay to 0
+```
+
+### KL Coefficient (c₃)
+
+**Default:** 0.1
+
+**Effect:**
+- **Too small:** Policy drifts from reference, mode collapse
+- **Too large:** Policy can't improve, stuck near initialization
+
+**Adaptive:** Some implementations adjust dynamically based on observed KL
+
+### PPO Epochs
+
+**Default:** 4
+
+**Effect:**
+- **Too few (1-2):** Inefficient, not reusing data enough
+- **Too many (10+):** Overfitting to rollout batch, instability
+
+**Typical range:** 3-5
+
+### Batch Size
+
+**Default:** 4-8 prompts per rollout
+
+**Effect:**
+- **Too small:** High variance, unstable
+- **Too large:** Slower iterations, memory issues
+
+**Note:** Effective batch size = batch_size × sequence_length × ppo_epochs
+
+## PPO vs Other RL Algorithms
+
+### PPO vs REINFORCE
+
+**REINFORCE** (vanilla policy gradient):
+
+$$
+\nabla_\theta J = \mathbb{E} \left[ \nabla_\theta \log \pi_\theta(a|s) \cdot R \right]
+$$
+
+**Problems:**
+- ❌ High variance (single trajectory estimates)
+- ❌ Unstable (no trust region)
+- ❌ Sample inefficient (can't reuse data)
+
+**PPO improvements:**
+- ✅ Lower variance (uses value function baseline)
+- ✅ Stable (clipping prevents big changes)
+- ✅ Sample efficient (multiple epochs on same data)
+
+### PPO vs A3C
+
+**A3C** (Asynchronous Advantage Actor-Critic):
+
+- Multiple parallel workers collect data
+- Asynchronous updates to shared policy
+
+**Problems:**
+- ❌ Complex implementation (parallelism)
+- ❌ Can be unstable (async updates)
+- ❌ Harder to debug
+
+**PPO advantages:**
+- ✅ Simpler (single process, batched updates)
+- ✅ More stable (clipping)
+- ✅ Easier to tune
+
+### PPO vs TRPO
+
+**TRPO** (Trust Region Policy Optimization):
+
+$$
+\max_\theta \mathbb{E}[R] \quad \text{s.t.} \quad D_{\text{KL}}(\pi_{\text{old}} \| \pi_\theta) \leq \delta
+$$
+
+**Advantages of TRPO:**
+- Theoretically principled trust region
+- Guaranteed monotonic improvement
+
+**Why PPO is preferred:**
+- ✅ Much simpler to implement (no second-order optimization)
+- ✅ Faster computation (no Fisher matrix)
+- ✅ Similar empirical performance
+- ✅ Easier to tune
+
+## Theoretical Guarantees
+
+PPO provides some theoretical guarantees (though weaker than TRPO):
+
+### Monotonic Improvement (Approximately)
+
+With appropriate hyperparameters, PPO tends to monotonically improve the policy:
+
+$$
+J(\theta_{k+1}) \geq J(\theta_k) \text{ (in expectation)}
+$$
+
+**Why "approximately"?** The clipping is a heuristic, not a rigorous constraint. But empirically it works!
+
+### Sample Complexity
+
+PPO is **sample efficient** compared to on-policy methods:
+- Reuses each trajectory multiple times (ppo_epochs)
+- Importance sampling corrects for distribution mismatch
+- Clipping prevents wasting samples on bad updates
+
+### Convergence
+
+Under certain conditions (small learning rate, appropriate clipping), PPO converges to a local optimum.
+
+**In practice:** Convergence is often to a "good enough" policy, not global optimum (which is fine for LLMs!).
+
+## Advanced PPO Variants
+
+### PPO-Penalty
+
+Instead of clipping, use KL divergence directly in loss:
+
+$$
+L_{\text{PENALTY}} = \mathbb{E}_t \left[ r_t \hat{A}_t - \beta \cdot D_{\text{KL}}(\pi_{\text{old}} \| \pi) \right]
+$$
+
+**Adaptive β:** Adjust $\beta$ based on observed KL:
+- If KL too high: increase $\beta$ (stricter penalty)
+- If KL too low: decrease $\beta$ (allow more change)
+
+**Pros:** Theoretically cleaner than clipping
+
+**Cons:** One more hyperparameter to tune
+
+### PPO with Auxiliary Losses
+
+Add auxiliary objectives to improve learning:
+
+$$
+L = L^{\text{CLIP}} + c_1 L^{V} + c_2 H + c_{\text{aux}} L^{\text{AUX}}
+$$
+
+**Examples:**
+- **Reconstruction loss:** Predict masked tokens (like BERT)
+- **Contrastive loss:** Distinguish good vs bad responses
+- **Diversity loss:** Encourage generating diverse responses
+
+Used in some production systems but adds complexity.
+
+## Debugging PPO Training
+
+### What to Monitor
+
+**Essential metrics:**
+
+1. **Policy loss:** Should decrease over time
+2. **Value loss:** Should decrease (value function improving)
+3. **Clip fraction:** Should be 10-30%
+4. **Average ratio:** Should stay close to 1.0 (< 1.2)
+5. **KL divergence:** Should be small (< 0.05)
+6. **Entropy:** Should decrease slowly (not collapse to 0)
+7. **Mean reward:** Should increase over time
+
+### Common Issues
+
+**Clip fraction too low (< 5%):**
+- Policy not changing much
+- Solution: Increase learning rate or decrease ε
+
+**Clip fraction too high (> 50%):**
+- Policy changing too fast
+- Solution: Decrease learning rate or increase ε
+
+**Ratio drifting (> 1.5):**
+- Policy unstable
+- Solution: Increase KL penalty, decrease learning rate
+
+**Entropy collapsing (< 0.1):**
+- Mode collapse, policy too deterministic
+- Solution: Increase entropy coefficient
+
+**KL exploding (> 0.1):**
+- Policy diverging from reference
+- Solution: Increase KL coefficient, decrease learning rate
+
+**Value loss not decreasing:**
+- Value network not learning
+- Solution: Increase value coefficient, check learning rate
+
+### Visualization Tips
+
+Plot these over training:
+
+```python
+import matplotlib.pyplot as plt
+
+# Track metrics
+metrics_history = {
+    "reward": [],
+    "kl": [],
+    "clip_fraction": [],
+    "entropy": []
+}
+
+# After each training step
+metrics_history["reward"].append(mean_reward)
+metrics_history["kl"].append(kl_divergence)
+# ...
+
+# Plot
+fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+axes[0, 0].plot(metrics_history["reward"])
+axes[0, 0].set_title("Mean Reward")
+axes[0, 1].plot(metrics_history["kl"])
+axes[0, 1].set_title("KL Divergence")
+axes[1, 0].plot(metrics_history["clip_fraction"])
+axes[1, 0].set_title("Clip Fraction")
+axes[1, 1].plot(metrics_history["entropy"])
+axes[1, 1].set_title("Entropy")
+plt.tight_layout()
+plt.savefig("ppo_training.png")
+```
+
+## Code Example: Using PPO Loss
+
+Here's how to use the PPO loss in a training loop:
+
+```python
+from src.auto_bot_tuner.rlhf.ppo_loss import compute_ppo_total_loss
+
+# Training loop
+for epoch in range(ppo_epochs):
+    # Forward pass through policy
+    policy_outputs = policy_model(input_ids, attention_mask)
+    logits = policy_outputs.logits
+
+    # Get log probabilities
+    log_probs = F.log_softmax(logits, dim=-1)
+    policy_logprobs = torch.gather(
+        log_probs[:, :-1],  # Shift for next-token prediction
+        dim=-1,
+        index=response_ids.unsqueeze(-1)
+    ).squeeze(-1)
+
+    # Get value estimates
+    value_outputs = value_network(input_ids, attention_mask)
+    values = value_outputs["values"]
+
+    # Compute PPO loss
+    loss, metrics = compute_ppo_total_loss(
+        policy_logprobs=policy_logprobs,
+        old_logprobs=old_logprobs,      # From rollout buffer
+        ref_logprobs=ref_logprobs,       # From reference model
+        values=values,
+        old_values=old_values,           # From rollout buffer
+        advantages=advantages,           # Computed via GAE
+        returns=returns,                 # Computed via GAE
+        logits=logits,
+        mask=attention_mask,
+        clip_ratio=0.2,
+        vf_coef=0.5,
+        entropy_coef=0.01,
+        kl_coef=0.1
+    )
+
+    # Backward pass
+    optimizer.zero_grad()
+    loss.backward()
+
+    # Gradient clipping
+    torch.nn.utils.clip_grad_norm_(
+        policy_model.parameters(),
+        max_norm=0.5
+    )
+
+    # Update
+    optimizer.step()
+
+    # Log metrics
+    print(f"Epoch {epoch}: Loss={metrics['total_loss']:.4f}, "
+          f"Reward={metrics['mean_reward']:.4f}, "
+          f"KL={metrics['kl_kl']:.4f}, "
+          f"Clip%={metrics['clip_fraction']*100:.1f}")
+```
+
+## Further Reading
+
+**Original Papers:**
+- [Proximal Policy Optimization Algorithms (Schulman et al., 2017)](https://arxiv.org/abs/1707.06347)
+- [Trust Region Policy Optimization (Schulman et al., 2015)](https://arxiv.org/abs/1502.05477)
+
+**RLHF Applications:**
+- [Training language models to follow instructions (InstructGPT, OpenAI 2022)](https://arxiv.org/abs/2203.02155)
+- [Learning to summarize from human feedback (OpenAI 2020)](https://arxiv.org/abs/2009.01325)
+
+**Implementation Guides:**
+- [Spinning Up in Deep RL - PPO](https://spinningup.openai.com/en/latest/algorithms/ppo.html)
+- [Hugging Face TRL Library](https://github.com/huggingface/trl)
+
+## Next Steps
+
+Now that you understand PPO, learn about the other critical components:
+
+1. **[KL Penalty](/rlhf/kl-penalty/)** - Why preventing drift is essential
+2. **[Training Dynamics](/rlhf/dynamics/)** - The complete two-phase training process
+3. **[Reference Models](/rlhf/reference/)** - Creating and managing frozen reference models
+
+The KL penalty is the key to stable RLHF - let's dive in! 🎯
