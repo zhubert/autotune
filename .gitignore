@@ -1,53 +1,37 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-.venv/
-venv/
-ENV/
-env/
+# Dependencies
+node_modules/
 
-# PyTorch
-*.pt
-*.pth
-*.ckpt
-!checkpoints/.gitkeep
+# Build outputs
+dist/
+.astro/
 
-# Project specific
-checkpoints/*
-!checkpoints/.gitkeep
-models/*
-!models/.gitkeep
-data/*
-!data/.gitkeep
+# Environment
+.env
+.env.*
 
-# Jupyter
-.ipynb_checkpoints
-*.ipynb
+# MacOS
+.DS_Store
 
 # IDE
 .vscode/
 .idea/
-*.swp
-*.swo
-*~
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Testing
-.pytest_cache/
-.coverage
-htmlcov/
-
-# Documentation
-docs/node_modules/
-docs/.astro/
-docs/dist/
 
 # Logs
 *.log
-wandb/
+npm-debug.log*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+
+# direnv
+.direnv/
+
+# Generated data files
+data/*.npz
+data/*.pkl
+models/
